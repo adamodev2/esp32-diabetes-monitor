@@ -1,6 +1,21 @@
 # Changelog
 
-All notable changes to the ESP32 CGM Display project between **Build 1.0.26** and **Build 1.0.34**.
+All notable changes to the ESP32 CGM Display project.
+
+## [1.0.42] - 2026-07-03
+
+### Added
+- **Libre delta readings**: Easily see the difference between current reading and last reading and/or last x readings
+- **Configurable Graph Y-Axis Indicator Lines**: Decoupled dotted indicators from alert warning thresholds
+- **Libre Config Trend Arrow Toggle**: Added checkbox to enable/disable the Libre Link Up trend arrow.
+- **Unified Alert Triggers & Colors System**: Merged the old warning limits and message rules into a single 10-rule alert engine. Supports Above, Below, Between, Drops Below (passing 2 thresholds over duration), and Rises Above (passing 2 thresholds over duration) rules with configurable Red, Amber, Green colors and optional custom dashboard messages.
+- **LLU Poll rate default**: Set default Libre Link Up poll rate to 1 minute.
+- **Backup & Restore**: Added support for all new functions
+- **Display rotation**: Can now rotate the display
+- **BETA BETA BETA MQTT / Home Assistant Integration**: Enabled TCP (1883) and TLS (8883) secure MQTT client connections.
+- **Bi-directional MQTT commands**: Listens for incoming commands on `<prefix>/cmd/refresh` (forces LibreLinkUp fetch), `<prefix>/cmd/reboot` (reboots device), and `<prefix>/cmd/message` (displays custom status message at the bottom of the dashboard).
+
+---
 
 ## [1.0.34] - 2026-06-27
 
@@ -11,4 +26,3 @@ All notable changes to the ESP32 CGM Display project between **Build 1.0.26** an
 - **LCD Touch Screen Long Press Diagnostics**: Press and hold display for quick diagnostics
 - **Network / WiFi Configuration Webpage**: Added a dedicated `/wifi` settings webpage allowing you to reconfigure Wi-Fi SSID, Password, and Device Name (hostname) on the fly.
 - **DHCP Client Hostname**: Set customized hostname dynamically on boot using `WiFi.setHostname(device_name)`.
-
