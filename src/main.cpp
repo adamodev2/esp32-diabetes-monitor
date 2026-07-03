@@ -8,6 +8,7 @@
 #include <WebServer.h>
 #include <mbedtls/md.h>
 #include <Update.h>
+#include <PubSubClient.h>
 #include "LGFX_ESP32S3_RGB_TFT_SPI_ST7701_GT911.h"
 
 // Instantiate the display driver
@@ -15,7 +16,7 @@ LGFX gfx;
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.34"
+#define BUILD_VERSION "1.0.42"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -24,8 +25,25 @@ char llu_email[64] = "";
 char llu_password[64] = "";
 char llu_region[16] = "eu";
 char llu_units[10] = "mmol/L";
-int llu_poll_interval = 2;
+int llu_poll_interval = 1;
 bool is_configured = false;
+bool llu_show_trend = true;
+bool show_delta = false;
+bool show_delta5 = false;
+int delta_n_count = 5;
+
+struct AlertRule {
+  char type[16];        // "above", "below", "between", "drop", "rise"
+  float val1;           // Limit 1 / Start Value
+  float val2;           // Limit 2 / End Value
+  int duration_min;     // Duration in minutes
+  char color[16];       // "Red", "Amber", "Green"
+  char message[64];     // Optional text message
+  bool enabled;
+};
+
+AlertRule alert_rules[10];
+int alert_rules_count = 0;
 
 // Diabetes:M configurations
 bool dm_enable_connection = false;
@@ -52,6 +70,25 @@ int dm_d_start = 1140;
 int dm_d_end = 1170;
 bool dm_2fa_pending = false;
 char device_name[32] = "ESP32-CGM-Display";
+int display_rotation = 0;  // 0=0°, 1=90°, 2=180°, 3=270°
+
+// MQTT configuration
+bool mqtt_enabled = false;
+char mqtt_broker[64] = "";
+int  mqtt_port = 1883;
+char mqtt_user[32] = "";
+char mqtt_password[64] = "";
+char mqtt_topic_prefix[64] = "cgm";
+bool mqtt_use_tls = false;
+
+WiFiClient mqttWifiClient;
+WiFiClientSecure mqttWifiClientSecure;
+PubSubClient mqttClient;
+unsigned long mqtt_last_publish = 0;
+unsigned long mqtt_last_reconnect_attempt = 0;
+bool mqtt_connected = false;
+String mqtt_last_status = "Not configured";
+bool mqtt_force_refresh = false;  // set by incoming command
 
 
 struct DMCategory {
@@ -176,6 +213,8 @@ float w_high = 180.0;       // Warning High (Yellow above)
 float c_high = 216.0;       // Critical High (Red above)
 float graph_min = 40.0;     // Graph Y-Axis Min
 float graph_max = 250.0;    // Graph Y-Axis Max
+float graph_indicator_low = 90.0;  // Dotted indicator low line (default 90 mg/dL = 5 mmol/L)
+float graph_indicator_high = 180.0; // Dotted indicator high line (default 180 mg/dL = 10 mmol/L)
 
 // Helpers for unit conversions and timestamp formatting
 float toUserUnit(float val) {
@@ -325,15 +364,14 @@ void addDMLog(time_t ts, float val, const String &status) {
 char admin_password[32] = "";
 bool is_temp_password = true;
 
-struct MessageRule {
-  char type[16];
-  float val1;
-  float val2;
-  char text[64];
-};
-
-MessageRule msg_rules[10];
-int msg_rules_count = 0;
+void initializeDefaultAlertRules();
+void saveAlertRules();
+void updateGraphThresholdsFromRules();
+uint32_t getColorCode(const char* color_str);
+bool checkDropTrigger(float val1, float val2, int duration_min);
+bool checkRiseTrigger(float val1, float val2, int duration_min);
+void evaluateAlertRules(uint32_t &out_color, String &out_msg);
+String getDeltaRawStr(float val_curr, float val_prev);
 
 void generateRandomPassword() {
   const char charset[] = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -438,6 +476,15 @@ void parseAndSaveSettings(JsonVariant settings);
 int getSuggestedCategory(int hour, int minute);
 void set2FAPending(bool pending);
 
+// MQTT forward declarations
+void mqttReconnect();
+void mqttPublish();
+void mqttPublishDiscovery();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void handleLocalMqttGet();
+void handleLocalMqttSave();
+void handleLocalDisplaySave();
+
 
 
 
@@ -526,16 +573,19 @@ void loadPreferences() {
   String password = preferences.getString("password", "");
   String region = preferences.getString("region", "eu");
   String units = preferences.getString("units", "mmol/L");
-  llu_poll_interval = preferences.getInt("poll", 2);
+  llu_poll_interval = preferences.getInt("poll", 1);
   if (llu_poll_interval < 1) llu_poll_interval = 1;
   is_configured = preferences.getBool("configured", false);
+  llu_show_trend = preferences.getBool("llu_show_trend", true);
+  show_delta = preferences.getBool("show_delta", false);
+  show_delta5 = preferences.getBool("show_delta5", false);
+  delta_n_count = preferences.getInt("delta_n_cnt", 5);
+  if (delta_n_count < 1) delta_n_count = 5;
   
-  c_low = preferences.getFloat("c_low", 72.0);
-  w_low = preferences.getFloat("w_low", 90.0);
-  w_high = preferences.getFloat("w_high", 180.0);
-  c_high = preferences.getFloat("c_high", 216.0);
   graph_min = preferences.getFloat("g_min", 40.0);
   graph_max = preferences.getFloat("g_max", 250.0);
+  graph_indicator_low = preferences.getFloat("g_ind_low", 90.0);
+  graph_indicator_high = preferences.getFloat("g_ind_high", 180.0);
   
   String admin_pwd = preferences.getString("admin_pwd", "");
   
@@ -549,13 +599,11 @@ void loadPreferences() {
     }
   }
   
-  msg_rules_count = preferences.getInt("msg_rules_cnt", 0);
-  if (msg_rules_count > 10 || msg_rules_count < 0) msg_rules_count = 0;
-  if (msg_rules_count > 0) {
-    size_t read_len = preferences.getBytes("msg_rules", msg_rules, sizeof(msg_rules));
-    size_t expected_len = msg_rules_count * sizeof(MessageRule);
-    if (read_len < expected_len) {
-      msg_rules_count = read_len / sizeof(MessageRule);
+  alert_rules_count = preferences.getInt("alert_rules_cnt", -1);
+  if (alert_rules_count != -1) {
+    if (alert_rules_count > 10 || alert_rules_count < 0) alert_rules_count = 0;
+    if (alert_rules_count > 0) {
+      preferences.getBytes("alert_rules", alert_rules, sizeof(alert_rules));
     }
   }
   
@@ -615,6 +663,23 @@ void loadPreferences() {
   } else {
     initializeDefaultCategoryRules();
   }
+  // Load display rotation
+  display_rotation = preferences.getInt("disp_rot", 0);
+  if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
+  
+  // Load MQTT settings
+  mqtt_enabled = preferences.getBool("mqtt_en", false);
+  String mqtt_broker_str = preferences.getString("mqtt_broker", "");
+  mqtt_port = preferences.getInt("mqtt_port", 1883);
+  String mqtt_user_str = preferences.getString("mqtt_user", "");
+  String mqtt_pass_str = preferences.getString("mqtt_pass", "");
+  String mqtt_prefix_str = preferences.getString("mqtt_prefix", "cgm");
+  mqtt_use_tls = preferences.getBool("mqtt_tls", false);
+  
+  mqtt_broker_str.toCharArray(mqtt_broker, sizeof(mqtt_broker));
+  mqtt_user_str.toCharArray(mqtt_user, sizeof(mqtt_user));
+  mqtt_pass_str.toCharArray(mqtt_password, sizeof(mqtt_password));
+  mqtt_prefix_str.toCharArray(mqtt_topic_prefix, sizeof(mqtt_topic_prefix));
   
   preferences.end();
   
@@ -636,6 +701,11 @@ void loadPreferences() {
   dm_user_id_str.toCharArray(dm_user_id, sizeof(dm_user_id));
   dm_last_ts_str.toCharArray(dm_last_uploaded_libre_ts, sizeof(dm_last_uploaded_libre_ts));
 
+  if (alert_rules_count == -1) {
+    initializeDefaultAlertRules();
+    saveAlertRules();
+  }
+  updateGraphThresholdsFromRules();
   
   if (admin_pwd.length() > 0) {
     admin_pwd.toCharArray(admin_password, sizeof(admin_password));
@@ -645,17 +715,226 @@ void loadPreferences() {
   }
   
   // Sanitization / safety check
-  if (c_low <= 0.0) c_low = 72.0;
-  if (w_low <= 0.0) w_low = 90.0;
-  if (w_high <= 0.0) w_high = 180.0;
-  if (c_high <= 0.0) c_high = 216.0;
   if (graph_min <= 0.0) graph_min = 40.0;
+  if (graph_indicator_low <= 0.0) graph_indicator_low = 90.0;
+  if (graph_indicator_high <= 0.0) graph_indicator_high = 180.0;
   if (graph_max <= 0.0) graph_max = 250.0;
   
   Serial.printf("Loaded config. Configured: %d, Region: %s, Units: %s, Poll: %d min, Email: %s\n", 
                 is_configured, llu_region, llu_units, llu_poll_interval, llu_email);
   Serial.printf("Tolerances: crit_low=%.1f, warn_low=%.1f, warn_high=%.1f, crit_high=%.1f, graph_min=%.1f, graph_max=%.1f\n",
                 c_low, w_low, w_high, c_high, graph_min, graph_max);
+}
+
+void initializeDefaultAlertRules() {
+  alert_rules_count = 4;
+  
+  // 1. Below 72 -> Red, "Critical Low"
+  strcpy(alert_rules[0].type, "below");
+  alert_rules[0].val1 = 72.0;
+  alert_rules[0].val2 = 0.0;
+  alert_rules[0].duration_min = 0;
+  strcpy(alert_rules[0].color, "Red");
+  strcpy(alert_rules[0].message, "Critical Low");
+  alert_rules[0].enabled = true;
+  
+  // 2. Below 90 -> Amber, "Low Warning"
+  strcpy(alert_rules[1].type, "below");
+  alert_rules[1].val1 = 90.0;
+  alert_rules[1].val2 = 0.0;
+  alert_rules[1].duration_min = 0;
+  strcpy(alert_rules[1].color, "Amber");
+  strcpy(alert_rules[1].message, "Low Warning");
+  alert_rules[1].enabled = true;
+  
+  // 3. Above 180 -> Amber, "High Warning"
+  strcpy(alert_rules[2].type, "above");
+  alert_rules[2].val1 = 180.0;
+  alert_rules[2].val2 = 0.0;
+  alert_rules[2].duration_min = 0;
+  strcpy(alert_rules[2].color, "Amber");
+  strcpy(alert_rules[2].message, "High Warning");
+  alert_rules[2].enabled = true;
+  
+  // 4. Above 216 -> Red, "Critical High"
+  strcpy(alert_rules[3].type, "above");
+  alert_rules[3].val1 = 216.0;
+  alert_rules[3].val2 = 0.0;
+  alert_rules[3].duration_min = 0;
+  strcpy(alert_rules[3].color, "Red");
+  strcpy(alert_rules[3].message, "Critical High");
+  alert_rules[3].enabled = true;
+  
+  // Clean the rest
+  for (int i = 4; i < 10; i++) {
+    memset(&alert_rules[i], 0, sizeof(AlertRule));
+  }
+}
+
+void saveAlertRules() {
+  Preferences preferences;
+  preferences.begin("cgm-config", false);
+  preferences.putBytes("alert_rules", alert_rules, sizeof(alert_rules));
+  preferences.putInt("alert_rules_cnt", alert_rules_count);
+  preferences.end();
+}
+
+void updateGraphThresholdsFromRules() {
+  // Set defaults
+  c_low = 72.0;
+  w_low = 90.0;
+  w_high = 180.0;
+  c_high = 216.0;
+  
+  float max_red_below = -1.0;
+  float max_amber_below = -1.0;
+  float min_amber_above = 9999.0;
+  float min_red_above = 9999.0;
+  
+  for (int i = 0; i < alert_rules_count; i++) {
+    if (!alert_rules[i].enabled) continue;
+    
+    if (strcmp(alert_rules[i].type, "below") == 0) {
+      if (strcmp(alert_rules[i].color, "Red") == 0) {
+        if (alert_rules[i].val1 > max_red_below) {
+          max_red_below = alert_rules[i].val1;
+        }
+      } else if (strcmp(alert_rules[i].color, "Amber") == 0) {
+        if (alert_rules[i].val1 > max_amber_below) {
+          max_amber_below = alert_rules[i].val1;
+        }
+      }
+    } else if (strcmp(alert_rules[i].type, "above") == 0) {
+      if (strcmp(alert_rules[i].color, "Amber") == 0) {
+        if (alert_rules[i].val1 < min_amber_above) {
+          min_amber_above = alert_rules[i].val1;
+        }
+      } else if (strcmp(alert_rules[i].color, "Red") == 0) {
+        if (alert_rules[i].val1 < min_red_above) {
+          min_red_above = alert_rules[i].val1;
+        }
+      }
+    }
+  }
+  
+  if (max_red_below > 0.0) c_low = max_red_below;
+  if (max_amber_below > 0.0) w_low = max_amber_below;
+  if (min_amber_above < 9000.0) w_high = min_amber_above;
+  if (min_red_above < 9000.0) c_high = min_red_above;
+  
+  // Safety checks
+  if (c_low <= 0.0) c_low = 72.0;
+  if (w_low <= c_low) w_low = c_low + 5.0;
+  if (w_high <= w_low) w_high = w_low + 10.0;
+  if (c_high <= w_high) c_high = w_high + 5.0;
+}
+
+uint32_t getColorCode(const char* color_str) {
+  if (strcmp(color_str, "Red") == 0) return 0xD9534F;
+  if (strcmp(color_str, "Amber") == 0) return 0xF0AD4E;
+  if (strcmp(color_str, "Green") == 0) return 0x5CB85C;
+  return 0x5CB85C;
+}
+
+bool checkDropTrigger(float val1, float val2, int duration_min) {
+  if (last_glucose > val2) return false; // Current value must be <= val2
+  
+  int entries_to_check = duration_min / llu_poll_interval;
+  if (entries_to_check < 1) entries_to_check = 1;
+  if (entries_to_check >= history_count) entries_to_check = history_count - 1;
+  
+  for (int i = 1; i <= entries_to_check; i++) {
+    int idx = history_count - 1 - i;
+    if (idx >= 0) {
+      if (glucose_history[idx] >= val1) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool checkRiseTrigger(float val1, float val2, int duration_min) {
+  if (last_glucose < val2) return false; // Current value must be >= val2
+  
+  int entries_to_check = duration_min / llu_poll_interval;
+  if (entries_to_check < 1) entries_to_check = 1;
+  if (entries_to_check >= history_count) entries_to_check = history_count - 1;
+  
+  for (int i = 1; i <= entries_to_check; i++) {
+    int idx = history_count - 1 - i;
+    if (idx >= 0) {
+      if (glucose_history[idx] <= val1) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void evaluateAlertRules(uint32_t &out_color, String &out_msg) {
+  out_color = 0x5CB85C; // Default Green
+  out_msg = "";
+  
+  bool found_duration_alert = false;
+  
+  // 1. Evaluate duration-based rules first (drops, rises)
+  for (int i = 0; i < alert_rules_count; i++) {
+    if (!alert_rules[i].enabled) continue;
+    
+    if (strcmp(alert_rules[i].type, "drop") == 0) {
+      if (checkDropTrigger(alert_rules[i].val1, alert_rules[i].val2, alert_rules[i].duration_min)) {
+        out_msg = String(alert_rules[i].message);
+        out_color = getColorCode(alert_rules[i].color);
+        found_duration_alert = true;
+        break;
+      }
+    } else if (strcmp(alert_rules[i].type, "rise") == 0) {
+      if (checkRiseTrigger(alert_rules[i].val1, alert_rules[i].val2, alert_rules[i].duration_min)) {
+        out_msg = String(alert_rules[i].message);
+        out_color = getColorCode(alert_rules[i].color);
+        found_duration_alert = true;
+        break;
+      }
+    }
+  }
+  
+  // 2. Evaluate static rules next
+  if (!found_duration_alert) {
+    for (int i = 0; i < alert_rules_count; i++) {
+      if (!alert_rules[i].enabled) continue;
+      
+      bool match = false;
+      if (strcmp(alert_rules[i].type, "above") == 0) {
+        if (last_glucose > alert_rules[i].val1) match = true;
+      } else if (strcmp(alert_rules[i].type, "below") == 0) {
+        if (last_glucose < alert_rules[i].val1) match = true;
+      } else if (strcmp(alert_rules[i].type, "between") == 0) {
+        if (last_glucose >= alert_rules[i].val1 && last_glucose <= alert_rules[i].val2) match = true;
+      }
+      
+      if (match) {
+        out_msg = String(alert_rules[i].message);
+        out_color = getColorCode(alert_rules[i].color);
+        break;
+      }
+    }
+  }
+}
+
+String getDeltaRawStr(float val_curr, float val_prev) {
+  if (val_curr <= 0.0 || val_prev <= 0.0) return "";
+  
+  float diff = val_curr - val_prev;
+  String val_str = "";
+  
+  if (strcmp(llu_units, "mmol/L") == 0) {
+    val_str = String(diff / 18.0182, 1);
+  } else {
+    val_str = String((int)round(diff));
+  }
+  
+  return val_str;
 }
 
 void pushToHistory(float val) {
@@ -749,9 +1028,9 @@ void runLibreLinkUpTest(String &logOut) {
     
     logOut += "<p style='color:#5CB85C;'><b>Login HTTP Success!</b> Parsing JSON response...</p>";
     
-    logOut += "<details><summary style='color:#33B5E5;cursor:pointer;'>Show Raw Login Response JSON (Redact token if sharing)</summary>";
+    logOut += "<details><h3 style='color:#33B5E5;cursor:pointer;'>Show Raw Login Response JSON (Redact token if sharing)</h3>";
     logOut += "<pre style='background:#1a1a1a;color:#eee;padding:10px;border:1px solid #444;overflow:auto;max-height:200px;white-space:pre-wrap;word-break:break-all;'>" + response + "</pre>";
-    logOut += "</details><br/>";
+    logOut += "</div><br/>";
 
     DynamicJsonDocument resp_doc(16384);
     DeserializationError err = deserializeJson(resp_doc, response);
@@ -837,9 +1116,9 @@ void runLibreLinkUpTest(String &logOut) {
   
   logOut += "<p style='color:#5CB85C;'><b>Connections HTTP Success!</b> Parsing JSON response...</p>";
   
-  logOut += "<details><summary style='color:#33B5E5;cursor:pointer;'>Show Raw Connections Response JSON</summary>";
+  logOut += "<details><h3 style='color:#33B5E5;cursor:pointer;'>Show Raw Connections Response JSON</h3>";
   logOut += "<pre style='background:#1a1a1a;color:#eee;padding:10px;border:1px solid #444;overflow:auto;max-height:200px;white-space:pre-wrap;word-break:break-all;'>" + response + "</pre>";
-  logOut += "</details><br/>";
+  logOut += "</div><br/>";
 
   DynamicJsonDocument conn_doc(16384);
   DeserializationError err = deserializeJson(conn_doc, response);
@@ -927,9 +1206,18 @@ void setup() {
   Serial.begin(115200);
   Serial.printf("Firmware signature: %s\n", ota_signature);
   
+  // Quick load display rotation from NVS before initializing display
+  {
+    Preferences preferences;
+    preferences.begin("cgm-config", true);
+    display_rotation = preferences.getInt("disp_rot", 0);
+    if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
+    preferences.end();
+  }
+  
   // Initialize the LovyanGFX display
   gfx.init();
-  gfx.setRotation(0);
+  gfx.setRotation(display_rotation);
   
   // Set backlight pin GPIO 38 as output and turn it ON
   pinMode(38, OUTPUT);
@@ -1045,9 +1333,26 @@ void setup() {
   localServer.on("/debug-dm", HTTP_GET, handleLocalDebugDM);
   localServer.on("/wifi", HTTP_GET, handleLocalWifiGet);
   localServer.on("/save-wifi", HTTP_POST, handleLocalWifiSave);
+  localServer.on("/mqtt", HTTP_GET, handleLocalMqttGet);
+  localServer.on("/save-mqtt", HTTP_POST, handleLocalMqttSave);
+  localServer.on("/save-display", HTTP_POST, handleLocalDisplaySave);
   localServer.begin();
   Serial.print("Local WebServer started on IP: ");
   Serial.println(WiFi.localIP());
+  
+  // Initialize MQTT client
+  if (mqtt_enabled && strlen(mqtt_broker) > 0) {
+    if (mqtt_use_tls) {
+      mqttWifiClientSecure.setInsecure();  // Accept any certificate
+      mqttClient.setClient(mqttWifiClientSecure);
+    } else {
+      mqttClient.setClient(mqttWifiClient);
+    }
+    mqttClient.setServer(mqtt_broker, mqtt_port);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setBufferSize(512);
+    Serial.printf("MQTT configured: %s:%d (TLS: %s)\n", mqtt_broker, mqtt_port, mqtt_use_tls ? "yes" : "no");
+  }
   
   // Make initial API call if credentials exist
   if (strlen(llu_email) > 0 && strlen(llu_password) > 0) {
@@ -1082,7 +1387,9 @@ void loop() {
     bool success = libreLinkUpFetchData();
     drawDashboard(); // Redraw dashboard to update values/graphics
     
-    if (!success) {
+    if (success) {
+      mqttPublish();  // Publish updated data to MQTT
+    } else {
       gfx.setFont(&fonts::DejaVu18);
       gfx.setTextColor(0xD9534F);
       gfx.drawCenterString("Update Failed!", 240, 310);
@@ -1135,7 +1442,9 @@ void loop() {
           bool success = libreLinkUpFetchData();
           drawDashboard();
           
-          if (!success) {
+          if (success) {
+            mqttPublish();  // Publish updated data to MQTT
+          } else {
             gfx.setFont(&fonts::DejaVu18);
             gfx.setTextColor(0xD9534F);
             gfx.drawCenterString("Refresh Failed!", 240, 310);
@@ -1299,6 +1608,32 @@ void loop() {
     }
   }
   
+  // MQTT background tasks
+  if (mqtt_enabled && strlen(mqtt_broker) > 0 && WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      if (millis() - mqtt_last_reconnect_attempt >= 5000) {
+        mqtt_last_reconnect_attempt = millis();
+        mqttReconnect();
+      }
+    } else {
+      mqttClient.loop();
+    }
+    
+    // Periodic MQTT publish every 60 seconds (keepalive / status update)
+    if (mqttClient.connected() && (millis() - mqtt_last_publish >= 60000)) {
+      mqttPublish();
+    }
+    
+    // Handle incoming force-refresh command
+    if (mqtt_force_refresh && has_credentials) {
+      mqtt_force_refresh = false;
+      Serial.println("[MQTT] Force refresh command received. Polling LLU...");
+      libreLinkUpFetchData();
+      drawDashboard();
+      mqttPublish();
+    }
+  }
+  
   delay(50);
 }
 
@@ -1328,33 +1663,11 @@ void drawDashboard() {
   unsigned long elapsed_m = (millis() - last_fetch_time) / 60000;
   bool is_stale = (elapsed_m >= 15) || (last_fetch_time == 0);
   
+  String banner_msg = "";
   if (is_stale) {
     status_color = 0x888888; // Grey
   } else {
-    if (last_glucose < c_low || last_glucose > c_high) {
-      status_color = 0xD9534F; // Red (Critical)
-    } else if ((last_glucose >= c_low && last_glucose < w_low) || (last_glucose > w_high && last_glucose <= c_high)) {
-      status_color = 0xF0AD4E; // Orange/Yellow (Warning)
-    } else {
-      status_color = 0x5CB85C; // Green (Normal)
-    }
-  }
-  
-  // Evaluate custom messages
-  String banner_msg = "";
-  for (int i = 0; i < msg_rules_count; i++) {
-    bool match = false;
-    if (strcmp(msg_rules[i].type, "gt") == 0) {
-      if (last_glucose > msg_rules[i].val1) match = true;
-    } else if (strcmp(msg_rules[i].type, "lt") == 0) {
-      if (last_glucose < msg_rules[i].val1) match = true;
-    } else if (strcmp(msg_rules[i].type, "between") == 0) {
-      if (last_glucose >= msg_rules[i].val1 && last_glucose <= msg_rules[i].val2) match = true;
-    }
-    if (match) {
-      banner_msg = String(msg_rules[i].text);
-      break;
-    }
+    evaluateAlertRules(status_color, banner_msg);
   }
   
   int banner_top = (dm_enable_connection && dm_auto_send) ? (dm_2fa_pending ? 72 : 56) : 40;
@@ -1384,12 +1697,149 @@ void drawDashboard() {
     val_y = banner_top + 15;
     arrow_y = banner_top + 55;
   }
-  gfx.drawCenterString(glucose_str.c_str(), 210, val_y);
   
-  // 3. Draw the trend arrow in black on the banner background
+  // Format delta values
+  String d1_raw = "";
+  String d5_raw = "";
   if (!is_stale) {
-    drawTrendArrow(330, arrow_y, last_trend, 0x000000);
+    if (show_delta && history_count >= 2) {
+      d1_raw = getDeltaRawStr(last_glucose, glucose_history[history_count - 2]);
+    }
+    if (show_delta5 && history_count >= (delta_n_count + 1)) {
+      d5_raw = getDeltaRawStr(last_glucose, glucose_history[history_count - (delta_n_count + 1)]);
+    }
   }
+  
+  bool has_delta1 = (show_delta && d1_raw.length() > 0);
+  bool has_delta5 = (show_delta5 && d5_raw.length() > 0);
+  bool has_deltas = has_delta1 || has_delta5;
+  
+  if (has_deltas) {
+    String d1_formatted = "";
+    String d5_formatted = "";
+    
+    if (has_delta1 && has_delta5) {
+      d1_formatted = "1:  " + d1_raw;
+      d5_formatted = String(delta_n_count) + ":  " + d5_raw;
+    } else if (has_delta1) {
+      d1_formatted = "  " + d1_raw; // only 1 min delta -> triangle with 2 spaces
+    } else if (has_delta5) {
+      d5_formatted = String(delta_n_count) + ":  " + d5_raw;
+    }
+    
+    gfx.setFont(&fonts::DejaVu72);
+    int main_w = gfx.textWidth(glucose_str.c_str());
+    
+    int delta_w = 0;
+    int bracket_open_w = 0;
+    int bracket_close_w = 0;
+    
+    const int tri_w = 14;
+    const int tri_h = 12;
+    const int tri_gap = 4;
+    
+    if (has_delta1 && has_delta5) {
+      // Stacked in DejaVu24 inside DejaVu72 brackets
+      gfx.setFont(&fonts::DejaVu72);
+      bracket_open_w = gfx.textWidth("(");
+      bracket_close_w = gfx.textWidth(")");
+      
+      gfx.setFont(&fonts::DejaVu24);
+      int line1_total_w = tri_w + tri_gap + gfx.textWidth(d1_formatted.c_str());
+      int line2_total_w = tri_w + tri_gap + gfx.textWidth(d5_formatted.c_str());
+      int text_w = max(line1_total_w, line2_total_w);
+      delta_w = bracket_open_w + text_w + bracket_close_w;
+    } else {
+      // Single line in DejaVu24 (including brackets)
+      gfx.setFont(&fonts::DejaVu24);
+      String inner_str = has_delta1 ? d1_formatted : d5_formatted;
+      int paren_open_w = gfx.textWidth("(");
+      int paren_close_w = gfx.textWidth(")");
+      int text_w = gfx.textWidth(inner_str.c_str());
+      delta_w = paren_open_w + tri_w + tri_gap + text_w + paren_close_w;
+    }
+    
+    int arrow_w = (llu_show_trend && !is_stale) ? 40 : 0;
+    int total_w = main_w + 8 + delta_w;
+    if (arrow_w > 0) {
+      total_w += 8 + arrow_w;
+    }
+    
+    int start_x = (480 - total_w) / 2;
+    
+    // Draw main value
+    gfx.setTextDatum(textdatum_t::top_left);
+    gfx.setTextColor(0x000000);
+    gfx.setFont(&fonts::DejaVu72);
+    gfx.drawString(glucose_str.c_str(), start_x, val_y);
+    
+    int deltas_x = start_x + main_w + 8;
+    
+    if (has_delta1 && has_delta5) {
+      // 1. Draw large open bracket "(" in DejaVu72
+      gfx.setFont(&fonts::DejaVu72);
+      gfx.drawString("(", deltas_x, val_y);
+      
+      // 2. Draw stacked text in DejaVu24 (centered within text_w)
+      gfx.setFont(&fonts::DejaVu24);
+      int line1_total_w = tri_w + tri_gap + gfx.textWidth(d1_formatted.c_str());
+      int line2_total_w = tri_w + tri_gap + gfx.textWidth(d5_formatted.c_str());
+      int text_w = max(line1_total_w, line2_total_w);
+      
+      int line1_x = deltas_x + bracket_open_w + (text_w - line1_total_w) / 2;
+      int line2_x = deltas_x + bracket_open_w + (text_w - line2_total_w) / 2;
+      
+      // Draw Line 1 (dt1) with vector triangle
+      int tri1_y = val_y + 10 + (24 - tri_h) / 2;
+      gfx.fillTriangle(line1_x + tri_w / 2, tri1_y, line1_x, tri1_y + tri_h, line1_x + tri_w, tri1_y + tri_h, 0x000000);
+      gfx.drawString(d1_formatted.c_str(), line1_x + tri_w + tri_gap, val_y + 10);
+      
+      // Draw Line 2 (dt5) with vector triangle
+      int tri2_y = val_y + 38 + (24 - tri_h) / 2;
+      gfx.fillTriangle(line2_x + tri_w / 2, tri2_y, line2_x, tri2_y + tri_h, line2_x + tri_w, tri2_y + tri_h, 0x000000);
+      gfx.drawString(d5_formatted.c_str(), line2_x + tri_w + tri_gap, val_y + 38);
+      
+      // 3. Draw large close bracket ")" in DejaVu72
+      gfx.setFont(&fonts::DejaVu72);
+      gfx.drawString(")", deltas_x + bracket_open_w + text_w, val_y);
+    } else {
+      // Draw single line with triangle (either ▲  0.5 or ▲5:  -0.2)
+      gfx.setFont(&fonts::DejaVu24);
+      String inner_str = has_delta1 ? d1_formatted : d5_formatted;
+      int paren_open_w = gfx.textWidth("(");
+      int text_w = gfx.textWidth(inner_str.c_str());
+      
+      gfx.drawString("(", deltas_x, val_y + 24);
+      
+      int tri_y = val_y + 24 + (24 - tri_h) / 2;
+      int tri_x = deltas_x + paren_open_w;
+      gfx.fillTriangle(tri_x + tri_w / 2, tri_y, tri_x, tri_y + tri_h, tri_x + tri_w, tri_y + tri_h, 0x000000);
+      
+      gfx.drawString(inner_str.c_str(), tri_x + tri_w + tri_gap, val_y + 24);
+      gfx.drawString(")", tri_x + tri_w + tri_gap + text_w, val_y + 24);
+    }
+    
+    // Draw trend arrow (if enabled)
+    if (arrow_w > 0) {
+      int arrow_x = deltas_x + delta_w + 8 + 20;
+      drawTrendArrow(arrow_x, arrow_y, last_trend, 0x000000);
+    }
+  } else {
+    // No deltas enabled, center glucose value
+    int centerX = (llu_show_trend && !is_stale) ? 210 : 240;
+    gfx.setTextDatum(textdatum_t::top_center);
+    gfx.setTextColor(0x000000);
+    gfx.setFont(&fonts::DejaVu72);
+    gfx.drawCenterString(glucose_str.c_str(), centerX, val_y);
+    
+    // Draw trend arrow (if enabled)
+    if (llu_show_trend && !is_stale) {
+      drawTrendArrow(330, arrow_y, last_trend, 0x000000);
+    }
+  }
+  
+  // Reset text datum to standard top_left
+  gfx.setTextDatum(textdatum_t::top_left);
   
   // 4. Draw the custom short message centered under the value
   if (banner_msg.length() > 0 && !is_stale) {
@@ -1484,11 +1934,11 @@ void drawHistoryGraph() {
   String low_label = "";
   String high_label = "";
   if (strcmp(llu_units, "mmol/L") == 0) {
-    low_label = String(w_low / 18.0182, 1);
-    high_label = String(w_high / 18.0182, 1);
+    low_label = String(graph_indicator_low / 18.0182, 1);
+    high_label = String(graph_indicator_high / 18.0182, 1);
   } else {
-    low_label = String((int)w_low);
-    high_label = String((int)w_high);
+    low_label = String((int)graph_indicator_low);
+    high_label = String((int)graph_indicator_high);
   }
 
   if (history_count == 0) {
@@ -1519,17 +1969,17 @@ void drawHistoryGraph() {
     }
   }
 
-  // Draw dotted threshold line for Low Warning (w_low) on top of bars
-  int y_low = mapGlucoseToY(w_low);
+  // Draw dotted indicator low line on top of bars
+  int y_low = mapGlucoseToY(graph_indicator_low);
   for (int x = startX; x < endX; x += 6) {
     gfx.drawFastHLine(x, y_low, 3, 0xAA2222); // Darker red dash overlay
   }
   gfx.setFont(&fonts::DejaVu18);
-  gfx.setTextColor(0xD9534F, 0x000000); // Bright red text on black background for overlay readability
+  gfx.setTextColor(0xD9534F, 0x000000); // Bright red text on black background
   gfx.drawString(low_label, startX + 8, y_low - 7);
   
-  // Draw dotted threshold line for High Warning (w_high) on top of bars
-  int y_high = mapGlucoseToY(w_high);
+  // Draw dotted indicator high line on top of bars
+  int y_high = mapGlucoseToY(graph_indicator_high);
   for (int x = startX; x < endX; x += 6) {
     gfx.drawFastHLine(x, y_high, 3, 0xAA7722); // Darker yellow/orange dash overlay
   }
@@ -1833,7 +2283,7 @@ void handleLocalRoot() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2, h3 { color:#33B5E5; text-align:center; }";
   html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
@@ -1907,14 +2357,14 @@ void handleLocalRoot() {
   
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalParam() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; text-align:center; }";
   html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
@@ -1968,10 +2418,13 @@ void handleLocalParam() {
   }
   html += "</select>";
   html += "</div>";
-  
   html += "<div class='form-group'>";
   html += "<label>API Poll Interval (minutes, min 1)</label>";
   html += "<input type='number' name='poll' value='" + String(llu_poll_interval) + "' min='1' max='60'>";
+  html += "</div>";
+  
+  html += "<div class='form-group'>";
+  html += "<label style='display:flex; align-items:center; color:#ccc;'><input type='checkbox' name='show_trend' value='1'" + String(llu_show_trend ? " checked" : "") + " style='width:auto; margin-right:8px;'> Show Libre Trend Indicator Arrow</label>";
   html += "</div>";
   
   html += "<a href='/test' class='btn btn-blue'>Test LibreLinkUp Connection</a>";
@@ -1982,9 +2435,9 @@ void handleLocalParam() {
   html += "</div>";
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
-
+ 
 void handleLocalSave() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
@@ -1993,20 +2446,22 @@ void handleLocalSave() {
     String email = localServer.arg("email");
     String password = localServer.arg("password");
     String region = localServer.arg("region");
-    int poll = localServer.hasArg("poll") ? localServer.arg("poll").toInt() : 2;
+    int poll = localServer.hasArg("poll") ? localServer.arg("poll").toInt() : 1;
     if (poll < 1) poll = 1;
+    llu_show_trend = localServer.hasArg("show_trend");
     
     email.toCharArray(llu_email, sizeof(llu_email));
     password.toCharArray(llu_password, sizeof(llu_password));
     region.toCharArray(llu_region, sizeof(llu_region));
     llu_poll_interval = poll;
-
+ 
     Preferences preferences;
     preferences.begin("cgm-config", false);
     preferences.putString("email", llu_email);
     preferences.putString("password", llu_password);
     preferences.putString("region", llu_region);
     preferences.putInt("poll", llu_poll_interval);
+    preferences.putBool("llu_show_trend", llu_show_trend);
     preferences.putBool("configured", true);
     preferences.end();
     
@@ -2020,12 +2475,12 @@ void handleLocalSave() {
     libreLinkUpFetchData();
     drawDashboard();
     
-    String html = "<html><head><meta http-equiv='refresh' content='3;url=/param'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+    String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/param'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
     html += "<h2>LibreLinkUp Settings Saved!</h2>";
     html += "<p>Updating follower credentials and returning to configuration page...</p>";
     html += "</body></html>";
     
-    localServer.send(200, "text/html", html);
+    localServer.send(200, "text/html; charset=utf-8", html);
   } else {
     localServer.send(400, "text/plain", "Bad Request: Missing parameters");
   }
@@ -2034,7 +2489,7 @@ void handleLocalSave() {
 void handleLocalTest() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
-  String logOut = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String logOut = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   logOut += "body{font-family:sans-serif;background:#222;color:#fff;padding:20px;}";
   logOut += "h3,h4{color:#33B5E5;}";
   logOut += "p{margin:10px 0;}";
@@ -2047,19 +2502,19 @@ void handleLocalTest() {
   logOut += "<br/><a href='/param' class='button button-back'>Back to Menu</a>";
   logOut += "</body></html>";
   
-  localServer.send(200, "text/html", logOut);
+  localServer.send(200, "text/html; charset=utf-8", logOut);
 }
 
 void handleLocalReboot() {
   if (!checkAuth()) return;
-  localServer.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='10;url=/'></head><body style='background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;'><h2>Rebooting device...</h2><p>Returning to Home Page in 10 seconds...</p></body></html>");
+  localServer.send(200, "text/html; charset=utf-8", "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='10;url=/'></head><body style='background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;'><h2>Rebooting device...</h2><p>Returning to Home Page in 10 seconds...</p></body></html>");
   delay(1000);
   ESP.restart();
 }
 
 void handleLocalUpdateGet() {
   if (!checkAuth()) return;
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; }";
   html += ".card { background:#222; padding:20px; border-radius:8px; border:1px solid #333; display:inline-block; text-align:left; max-width:400px; width:100%; box-sizing:border-box; }";
@@ -2151,7 +2606,7 @@ void handleLocalUpdateGet() {
   html += "</script>";
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalUpdatePost() {
@@ -2222,7 +2677,7 @@ bool checkForceReset() {
 void handleLocalChangePasswordGet() {
   if (!checkAuth()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; text-align:center; }";
   html += ".card { background:#222; padding:20px; border-radius:8px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
@@ -2261,7 +2716,7 @@ void handleLocalChangePasswordGet() {
   html += "</div>";
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalSavePasswordPost() {
@@ -2295,12 +2750,12 @@ void handleLocalSavePasswordPost() {
     
     Serial.println("Admin portal password successfully updated.");
     
-    String html = "<html><head><meta http-equiv='refresh' content='3;url=/'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+    String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
     html += "<h2>Password Saved Successfully!</h2>";
     html += "<p>Updating admin credentials and returning to landing page...</p>";
     html += "</body></html>";
     
-    localServer.send(200, "text/html", html);
+    localServer.send(200, "text/html; charset=utf-8", html);
   } else {
     localServer.send(400, "text/plain", "Bad Request: Missing parameters");
   }
@@ -2310,12 +2765,12 @@ void handleLocalFactoryReset() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#d9534f;}</style></head><body>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#d9534f;}</style></head><body>";
   html += "<h2>Factory Reset Initiated</h2>";
   html += "<p>All settings, Wi-Fi credentials, passwords, and data are being erased.</p>";
   html += "<p>The device will reboot shortly. Please connect to <b>ESP32-CGM-Config</b> Wi-Fi to reconfigure.</p>";
   html += "</body></html>";
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
   
   delay(1500);
   
@@ -2336,13 +2791,14 @@ void handleLocalGeneralGet() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; text-align:center; }";
-  html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
+  html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:700px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
   html += "details { background:#111; border:1px solid #333; border-radius:6px; margin-bottom:15px; padding:10px 15px; }";
   html += "summary { color:#33B5E5; font-size:18px; font-weight:bold; cursor:pointer; outline:none; padding:5px 0; }";
   html += "summary::-webkit-details-marker { color:#33B5E5; }";
+
   html += ".form-group { margin-bottom:15px; }";
   html += "label { display:block; margin-bottom:5px; color:#aaa; font-weight:bold; }";
   html += "input, select { width:100%; padding:10px; border-radius:4px; border:1px solid #444; background:#222; color:#fff; box-sizing:border-box; font-size:16px; }";
@@ -2350,16 +2806,22 @@ void handleLocalGeneralGet() {
   html += ".btn-blue { background:#33B5E5; }";
   html += ".btn-grey { background:#555; margin-top:10px; }";
   html += ".btn-red { background:#d9534f; margin-top:0; }";
-  html += ".rule-row { display:flex; align-items:center; gap:8px; margin-bottom:10px; border-bottom:1px solid #333; padding-bottom:10px; flex-wrap:wrap; }";
-  html += ".rule-row select { width:auto; }";
-  html += ".rule-row input[type=number] { width:80px; }";
-  html += ".rule-row input[type=text] { width:280px; }";
-  html += ".val2-container { display:inline-flex; align-items:center; gap:8px; }";
+  html += ".rule-row { display:flex; flex-direction:column; gap:8px; margin-bottom:15px; border-bottom:1px solid #333; padding-bottom:15px; }";
+  html += ".rule-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }";
+  html += ".rule-row select { width:auto; padding:8px; }";
+  html += ".rule-row input[type=number] { width:80px; padding:8px; }";
+  html += ".rule-row input[type=text] { flex-grow:1; width:auto; padding:8px; }";
+  html += ".rule-row .delete-btn { width:40px; height:40px; padding:0; margin:0; display:inline-flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }";
+  html += ".val2-container, .duration-container { display:inline-flex; align-items:center; gap:5px; }";
+  html += ".check-label { display:inline-flex; align-items:center; gap:4px; font-weight:normal; color:#ccc; cursor:pointer; margin:0; }";
+  html += ".check-label input { width:auto; margin:0; }";
   html += "</style></head><body>";
   
   html += "<div class='card'>";
   html += "<h2>Configure General Settings</h2>";
   html += "<form action='/save-general' method='POST'>";
+  html += "<div id='js_error_console' style='display:none;background:#d9534f;color:#fff;padding:10px;margin-bottom:15px;border-radius:4px;text-align:left;font-family:monospace;font-size:14px;box-sizing:border-box;max-width:700px;margin-left:auto;margin-right:auto;'></div>";
+  html += "<script>window.onerror = function(msg, url, line) { var c = document.getElementById('js_error_console'); if(c) { c.style.display='block'; c.innerHTML += '<div><strong>JS Error:</strong> ' + msg + ' at ' + url + ':' + line + '</div>'; } return false; };</script>";
   
   // 1. Display units section
   html += "<details>";
@@ -2379,33 +2841,24 @@ void handleLocalGeneralGet() {
   html += "</div>";
   html += "</details>";
   
-  String stepStr = (strcmp(llu_units, "mmol/L") == 0) ? "0.1" : "1";
-
-  // 2. Colour Tolerances section
+  // 2. Values section
   html += "<details>";
-  html += "<summary id='colour_tolerances_summary'>Colour Tolerances (" + String(llu_units) + ")</summary>";
+  html += "<summary>Values</summary>";
   html += "<div style='padding-top:10px;'>";
   html += "<div class='form-group'>";
-  html += "<label>Critical Low Limit (Red warning below this)</label>";
-  html += "<input type='number' step='" + stepStr + "' name='c_low' value='" + formatUserUnitValue(c_low) + "'>";
+  html += "<label class='check-label'><input type='checkbox' name='show_delta' value='1'" + String(show_delta ? " checked" : "") + "> Show last delta reading</label>";
   html += "</div>";
-  
   html += "<div class='form-group'>";
-  html += "<label>Warning Low Limit (Yellow warning below this)</label>";
-  html += "<input type='number' step='" + stepStr + "' name='w_low' value='" + formatUserUnitValue(w_low) + "'>";
+  html += "<label class='check-label'><input type='checkbox' name='show_delta5' value='1'" + String(show_delta5 ? " checked" : "") + "> Show historical delta reading (Delta #)</label>";
+  html += "<div style='margin-left:24px;margin-top:5px;'>";
+  html += "<label style='display:inline-block;font-weight:normal;margin-right:5px;'>Historical counts:</label>";
+  html += "<input type='number' name='delta_n_count' value='" + String(delta_n_count) + "' min='1' max='100' style='width:70px;display:inline-block;padding:5px;'>";
   html += "</div>";
-  
-  html += "<div class='form-group'>";
-  html += "<label>Warning High Limit (Yellow warning above this)</label>";
-  html += "<input type='number' step='" + stepStr + "' name='w_high' value='" + formatUserUnitValue(w_high) + "'>";
-  html += "</div>";
-  
-  html += "<div class='form-group'>";
-  html += "<label>Critical High Limit (Red warning above this)</label>";
-  html += "<input type='number' step='" + stepStr + "' name='c_high' value='" + formatUserUnitValue(c_high) + "'>";
   html += "</div>";
   html += "</div>";
   html += "</details>";
+  
+  String stepStr = (strcmp(llu_units, "mmol/L") == 0) ? "0.1" : "1";
   
   // 3. Graph Y-Axis Range section
   html += "<details>";
@@ -2415,43 +2868,84 @@ void handleLocalGeneralGet() {
   html += "<label>Graph Y-Axis Minimum (clamped if below)</label>";
   html += "<input type='number' step='" + stepStr + "' name='g_min' value='" + formatUserUnitValue(graph_min) + "'>";
   html += "</div>";
-  
   html += "<div class='form-group'>";
   html += "<label>Graph Y-Axis Maximum (clamped if above)</label>";
   html += "<input type='number' step='" + stepStr + "' name='g_max' value='" + formatUserUnitValue(graph_max) + "'>";
   html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label>Dotted Indicator Line Low</label>";
+  html += "<input type='number' step='" + stepStr + "' name='g_ind_low' value='" + formatUserUnitValue(graph_indicator_low) + "'>";
+  html += "</div>";
+  html += "<div class='form-group'>";
+  html += "<label>Dotted Indicator Line High</label>";
+  html += "<input type='number' step='" + stepStr + "' name='g_ind_high' value='" + formatUserUnitValue(graph_indicator_high) + "'>";
+  html += "</div>";
   html += "</div>";
   html += "</details>";
   
-  // 4. Custom Messages section
+  // 4. Alert Triggers & Colors section (replacing Tolerances and Custom Messages)
   html += "<details>";
-  html += "<summary>Custom Messages (max 10)</summary>";
+  html += "<summary>Alert Triggers & Colors (max 10)</summary>";
   html += "<div style='padding-top:10px;'>";
   html += "<div id='rules_container' style='margin-bottom:15px;'>";
   
-  // Render existing rules
-  for (int i = 0; i < msg_rules_count; i++) {
+  for (int i = 0; i < alert_rules_count; i++) {
     html += "<div class='rule-row'>";
-    html += "<select class='type-select' name='msg_type_" + String(i) + "' onchange='reindexRules()'>";
-    html += "<option value='gt'"; if (strcmp(msg_rules[i].type, "gt") == 0) html += " selected"; html += ">&gt; (greater than)</option>";
-    html += "<option value='lt'"; if (strcmp(msg_rules[i].type, "lt") == 0) html += " selected"; html += ">&lt; (less than)</option>";
-    html += "<option value='between'"; if (strcmp(msg_rules[i].type, "between") == 0) html += " selected"; html += ">between</option>";
+    
+    // Line 1: Enabled, Trigger type, limits/durations
+    html += "<div class='rule-line'>";
+    html += "<label class='check-label'><input type='checkbox' class='en-checkbox' name='alert_en_" + String(i) + "' value='1'" + String(alert_rules[i].enabled ? " checked" : "") + "> Enabled</label>";
+    
+    html += "<select class='type-select' name='alert_type_" + String(i) + "' onchange='handleTypeChange(this)'>";
+    html += "<option value='above'"; if (strcmp(alert_rules[i].type, "above") == 0) html += " selected"; html += ">Above</option>";
+    html += "<option value='below'"; if (strcmp(alert_rules[i].type, "below") == 0) html += " selected"; html += ">Below</option>";
+    html += "<option value='between'"; if (strcmp(alert_rules[i].type, "between") == 0) html += " selected"; html += ">Between</option>";
+    html += "<option value='drop'"; if (strcmp(alert_rules[i].type, "drop") == 0) html += " selected"; html += ">Drops Below</option>";
+    html += "<option value='rise'"; if (strcmp(alert_rules[i].type, "rise") == 0) html += " selected"; html += ">Rises Above</option>";
     html += "</select> ";
     
-    html += "<input type='number' step='" + stepStr + "' class='val1-input' name='msg_val1_" + String(i) + "' value='" + formatUserUnitValue(msg_rules[i].val1) + "' required> ";
+    String val1Label = "Limit:";
+    if (strcmp(alert_rules[i].type, "between") == 0) val1Label = "From:";
+    else if (strcmp(alert_rules[i].type, "drop") == 0) val1Label = "Drops from:";
+    else if (strcmp(alert_rules[i].type, "rise") == 0) val1Label = "Rises from:";
     
-    String display_style = (strcmp(msg_rules[i].type, "between") == 0) ? "inline-flex" : "none";
-    html += "<span class='val2-container' style='display:" + display_style + ";'>";
-    html += "and <input type='number' step='" + stepStr + "' class='val2-input' name='msg_val2_" + String(i) + "' value='" + formatUserUnitValue(msg_rules[i].val2) + "'> ";
+    html += "<span class='val1-label'>" + val1Label + "</span> ";
+    html += "<input type='number' step='" + stepStr + "' class='val1-input' name='alert_val1_" + String(i) + "' value='" + formatUserUnitValue(alert_rules[i].val1) + "'> ";
+    
+    String val2_display = (strcmp(alert_rules[i].type, "between") == 0 || strcmp(alert_rules[i].type, "drop") == 0 || strcmp(alert_rules[i].type, "rise") == 0) ? "inline-flex" : "none";
+    String val2_label = "and";
+    if (strcmp(alert_rules[i].type, "drop") == 0 || strcmp(alert_rules[i].type, "rise") == 0) val2_label = "to";
+    String val2_suffix = "";
+    if (strcmp(alert_rules[i].type, "drop") == 0) val2_suffix = "(or below)";
+    else if (strcmp(alert_rules[i].type, "rise") == 0) val2_suffix = "(or above)";
+    
+    html += "<span class='val2-container' style='display:" + val2_display + ";'>";
+    html += "<span class='val2-label'>" + val2_label + "</span> <input type='number' step='" + stepStr + "' class='val2-input' name='alert_val2_" + String(i) + "' value='" + formatUserUnitValue(alert_rules[i].val2) + "'> <span class='val2-suffix'>" + val2_suffix + "</span>";
     html += "</span> ";
     
-    html += "<input type='text' class='text-input' name='msg_text_" + String(i) + "' value='" + String(msg_rules[i].text) + "' placeholder='Message' maxlength='63' required> ";
-    html += "<button type='button' class='btn btn-red' onclick='this.parentNode.remove();reindexRules();' style='width:auto;'>Delete</button>";
+    String duration_display = (strcmp(alert_rules[i].type, "drop") == 0 || strcmp(alert_rules[i].type, "rise") == 0) ? "inline-flex" : "none";
+    html += "<span class='duration-container' style='display:" + duration_display + ";'>";
+    html += "within <input type='number' class='duration-input' name='alert_duration_" + String(i) + "' value='" + String(alert_rules[i].duration_min) + "'> min";
+    html += "</span> ";
+    
+    html += "<select class='color-select' name='alert_color_" + String(i) + "' style='width:auto;'>";
+    html += "<option value='Red'"; if (strcmp(alert_rules[i].color, "Red") == 0) html += " selected"; html += ">Red</option>";
+    html += "<option value='Amber'"; if (strcmp(alert_rules[i].color, "Amber") == 0) html += " selected"; html += ">Amber</option>";
+    html += "<option value='Green'"; if (strcmp(alert_rules[i].color, "Green") == 0) html += " selected"; html += ">Green</option>";
+    html += "</select> ";
+    html += "</div>"; // End Line 1
+    
+    // Line 2: Message, delete
+    html += "<div class='rule-line' style='margin-top:8px;'>";
+    html += "<input type='text' class='text-input' name='alert_msg_" + String(i) + "' value='" + String(alert_rules[i].message) + "' placeholder='Optional Message' maxlength='63'> ";
+    html += "<button type='button' class='btn btn-red delete-btn' onclick='this.parentNode.parentNode.remove();reindexRules();' title='Delete Rule'>🗑</button>";
+    html += "</div>"; // End Line 2
+    
     html += "</div>";
   }
   
   html += "</div>";
-  html += "<button type='button' id='add_btn' class='btn btn-blue' onclick='addRule()' style='width:auto;margin-bottom:20px;'>+ Add Message Condition</button><br/>";
+  html += "<button type='button' id='add_btn' class='btn btn-blue' onclick='addRule()' style='width:auto;margin-bottom:20px;'>+ Add Alert Rule</button><br/>";
   html += "</div>";
   html += "</details>";
   
@@ -2461,23 +2955,51 @@ void handleLocalGeneralGet() {
   html += "</div>";
   
   html += "<script>";
+  html += "function handleTypeChange(select) {";
+  html += "  var row = select.parentNode;";
+  html += "  var type = select.value;";
+  html += "  var val1Label = row.querySelector('.val1-label');";
+  html += "  var val2Container = row.querySelector('.val2-container');";
+  html += "  var val2Label = row.querySelector('.val2-label');";
+  html += "  var val2Suffix = row.querySelector('.val2-suffix');";
+  html += "  var durationContainer = row.querySelector('.duration-container');";
+  html += "  var val2Input = row.querySelector('.val2-input');";
+  html += "  var durationInput = row.querySelector('.duration-input');";
+  html += "  if (type === 'above' || type === 'below') {";
+  html += "    val1Label.textContent = 'Limit:';";
+  html += "    val2Container.style.display = 'none';";
+  html += "    durationContainer.style.display = 'none';";
+  html += "  } else if (type === 'between') {";
+  html += "    val1Label.textContent = 'From:';";
+  html += "    val2Label.textContent = 'and';";
+  html += "    val2Suffix.textContent = '';";
+  html += "    val2Container.style.display = 'inline-flex';";
+  html += "    durationContainer.style.display = 'none';";
+  html += "  } else if (type === 'drop') {";
+  html += "    val1Label.textContent = 'Drops from:';";
+  html += "    val2Label.textContent = 'to';";
+  html += "    val2Suffix.textContent = '(or below)';";
+  html += "    val2Container.style.display = 'inline-flex';";
+  html += "    durationContainer.style.display = 'inline-flex';";
+  html += "  } else if (type === 'rise') {";
+  html += "    val1Label.textContent = 'Rises from:';";
+  html += "    val2Label.textContent = 'to';";
+  html += "    val2Suffix.textContent = '(or above)';";
+  html += "    val2Container.style.display = 'inline-flex';";
+  html += "    durationContainer.style.display = 'inline-flex';";
+  html += "  }";
+  html += "}";
+  
   html += "function reindexRules() {";
   html += "  var rows = document.querySelectorAll('.rule-row');";
   html += "  rows.forEach(function(row, idx) {";
-  html += "    row.querySelector('.type-select').name = 'msg_type_' + idx;";
-  html += "    row.querySelector('.val1-input').name = 'msg_val1_' + idx;";
-  html += "    var val2Input = row.querySelector('.val2-input');";
-  html += "    if (val2Input) val2Input.name = 'msg_val2_' + idx;";
-  html += "    row.querySelector('.text-input').name = 'msg_text_' + idx;";
-  html += "    var type = row.querySelector('.type-select').value;";
-  html += "    var val2Container = row.querySelector('.val2-container');";
-  html += "    if (type === 'between') {";
-  html += "      val2Container.style.display = 'inline-flex';";
-  html += "      if (val2Input) val2Input.required = true;";
-  html += "    } else {";
-  html += "      val2Container.style.display = 'none';";
-  html += "      if (val2Input) val2Input.required = false;";
-  html += "    }";
+  html += "    row.querySelector('.en-checkbox').name = 'alert_en_' + idx;";
+  html += "    row.querySelector('.type-select').name = 'alert_type_' + idx;";
+  html += "    row.querySelector('.val1-input').name = 'alert_val1_' + idx;";
+  html += "    row.querySelector('.val2-input').name = 'alert_val2_' + idx;";
+  html += "    row.querySelector('.duration-input').name = 'alert_duration_' + idx;";
+  html += "    row.querySelector('.color-select').name = 'alert_color_' + idx;";
+html += "    row.querySelector('.text-input').name = 'alert_msg_' + idx;";
   html += "  });";
   html += "  document.getElementById('add_btn').style.display = (rows.length >= 10) ? 'none' : 'block';";
   html += "}";
@@ -2488,34 +3010,48 @@ void handleLocalGeneralGet() {
   html += "  newRow.className = 'rule-row';";
   html += "  var isMmol = (document.getElementById('units_select').value === 'mmol/L');";
   html += "  var stepAttr = isMmol ? '0.1' : '1';";
-  html += "  var inner = \"<select class='type-select' onchange='reindexRules()'>\";";
-  html += "  inner += \"<option value='gt'>&gt; (greater than)</option>\";";
-  html += "  inner += \"<option value='lt'>&lt; (less than)</option>\";";
-  html += "  inner += \"<option value='between'>between</option>\";";
-  html += "  inner += \"</select> \";";
-  html += "  inner += \"<input type='number' step='\" + stepAttr + \"' class='val1-input' required> \";";
-  html += "  inner += \"<span class='val2-container' style='display:none;'> \";";
-  html += "  inner += \"and <input type='number' step='\" + stepAttr + \"' class='val2-input'> \";";
+  html += "  var inner = \"<div class='rule-line'>\";";
+  html += "  inner += \"<label class='check-label'><input type='checkbox' class='en-checkbox' value='1' checked> Enabled</label> \";";
+  html += "  inner += \"<select class='type-select' onchange='handleTypeChange(this)'>\";";
+  html += "  inner += \"<option value='above'>Above</option>\";";
+  html += "  inner += \"<option value='below'>Below</option>\";";
+  html += "  inner += \"<option value='between'>Between</option>\";";
+  html += "  inner += \"<option value='drop'>Drops Below</option>\";";
+  html += "  inner += \"<option value='rise'>Rises Above</option>\";";
+  html += "  inner += \"  </select> \";";
+  html += "  inner += \"<span class='val1-label'>Limit:</span> \";";
+  html += "  inner += \"<input type='number' step='\" + stepAttr + \"' class='val1-input'> \";";
+  html += "  inner += \"<span class='val2-container' style='display:none;'>\";";
+  html += "  inner += \"<span class='val2-label'>and</span> <input type='number' step='\" + stepAttr + \"' class='val2-input'> <span class='val2-suffix'></span>\";";
   html += "  inner += \"</span> \";";
-  html += "  inner += \"<input type='text' class='text-input' placeholder='Message' maxlength='63' required> \";";
-  html += "  inner += \"<button type='button' class='btn btn-red' onclick='this.parentNode.remove();reindexRules();' style='width:auto;'>Delete</button>\";";
+  html += "  inner += \"<span class='duration-container' style='display:none;'>\";";
+  html += "  inner += \"within <input type='number' class='duration-input' value='5'> min\";";
+  html += "  inner += \"</span>\";";
+  html += "  inner += \"</div>\";";
+  html += "  inner += \"<div class='rule-line' style='margin-top:8px;'>\";";
+  html += "  inner += \"<select class='color-select'>\";";
+  html += "  inner += \"<option value='Red'>Red</option>\";";
+  html += "  inner += \"<option value='Amber'>Amber</option>\";";
+  html += "  inner += \"<option value='Green'>Green</option>\";";
+  html += "  inner += \"  </select> \";";
+  html += "  inner += \"<input type='text' class='text-input' placeholder='Optional Message' maxlength='63'> \";";
+  html += "  inner += \"<button type='button' class='btn btn-red' onclick='this.parentNode.parentNode.remove();reindexRules();' style='width:40px;height:40px;padding:0;margin:0;display:inline-flex;align-items:center;justify-content:center;font-size:18px;' title='Delete Rule'>🗑</button>\";";
+  html += "  inner += \"</div>\";";
   html += "  newRow.innerHTML = inner;";
   html += "  container.appendChild(newRow);";
   html += "  reindexRules();";
   html += "}";
   
-  html += "function handleUnitsChange() {";
+html += "function handleUnitsChange() {";
   html += "  var selectEl = document.getElementById('units_select');";
   html += "  var prevUnit = selectEl.getAttribute('data-prev') || (selectEl.value === 'mmol/L' ? 'mg/dL' : 'mmol/L');";
   html += "  var currentUnit = selectEl.value;";
   html += "  if (prevUnit === currentUnit) return;";
-  html += "  var colSum = document.getElementById('colour_tolerances_summary');";
-  html += "  if (colSum) colSum.textContent = 'Colour Tolerances (' + currentUnit + ')';";
   html += "  var grSum = document.getElementById('graph_range_summary');";
   html += "  if (grSum) grSum.textContent = 'Graph Y-Axis Range (' + currentUnit + ')';";
   html += "  var factor = 18.0182;";
   html += "  var isMmol = (currentUnit === 'mmol/L');";
-  html += "  var names = ['c_low', 'w_low', 'w_high', 'c_high', 'g_min', 'g_max'];";
+  html += "  var names = ['g_min', 'g_max', 'g_ind_low', 'g_ind_high'];";
   html += "  names.forEach(function(name) {";
   html += "    var input = document.querySelector(\"input[name='\" + name + \"']\");";
   html += "    if (input && input.value !== '') {";
@@ -2537,17 +3073,31 @@ void handleLocalGeneralGet() {
   html += "  ruleInputs.forEach(function(input) {";
   html += "    if (input && input.value !== '') {";
   html += "      var val = parseFloat(input.value);";
-  html += "      if (!isNaN(val)) {";
-  html += "        if (isMmol) {";
-  html += "          var newVal = val / factor;";
-  html += "          input.value = (Math.round(newVal * 10) / 10).toFixed(1);";
-  html += "          input.step = '0.1';";
-  html += "        } else {";
-  html += "          var newVal = val * factor;";
-  html += "          input.value = Math.round(newVal);";
-  html += "          input.step = '1';";
-  html += "        }";
-  html += "      }";
+  if (strcmp(llu_units, "mmol/L") == 0) {
+    html += "      if (!isNaN(val)) {";
+    html += "        if (isMmol) {";
+    html += "          var newVal = val / factor;";
+    html += "          input.value = (Math.round(newVal * 10) / 10).toFixed(1);";
+    html += "          input.step = '0.1';";
+    html += "        } else {";
+    html += "          var newVal = val * factor;";
+    html += "          input.value = Math.round(newVal);";
+    html += "          input.step = '1';";
+    html += "        }";
+    html += "      }";
+  } else {
+    html += "      if (!isNaN(val)) {";
+    html += "        if (isMmol) {";
+    html += "          var newVal = val / factor;";
+    html += "          input.value = (Math.round(newVal * 10) / 10).toFixed(1);";
+    html += "          input.step = '0.1';";
+    html += "        } else {";
+    html += "          var newVal = val * factor;";
+    html += "          input.value = Math.round(newVal);";
+    html += "          input.step = '1';";
+    html += "        }";
+    html += "      }";
+  }
   html += "    }";
   html += "  });";
   html += "  selectEl.setAttribute('data-prev', currentUnit);";
@@ -2558,7 +3108,7 @@ void handleLocalGeneralGet() {
   html += "  selectEl.setAttribute('data-prev', selectEl.value);";
   html += "  var isMmol = (selectEl.value === 'mmol/L');";
   html += "  var stepAttr = isMmol ? '0.1' : '1';";
-  html += "  var names = ['c_low', 'w_low', 'w_high', 'c_high', 'g_min', 'g_max'];";
+  html += "  var names = ['g_min', 'g_max', 'g_ind_low', 'g_ind_high'];";
   html += "  names.forEach(function(name) {";
   html += "    var input = document.querySelector(\"input[name='\" + name + \"']\");";
   html += "    if (input) input.step = stepAttr;";
@@ -2567,93 +3117,206 @@ void handleLocalGeneralGet() {
   html += "  ruleInputs.forEach(function(input) {";
   html += "    if (input) input.step = stepAttr;";
   html += "  });";
-  html += "  reindexRules();";
+  html += "  var form = document.querySelector('form');";
+  html += "  if (form) {";
+  html += "    form.onsubmit = function(e) {";
+  html += "      var dbg = document.getElementById(\'js_error_console\');";
+  html += "      if (dbg) {";
+  html += "        dbg.style.display = \'block\';";
+  html += "        dbg.innerHTML = \'<div><strong>Debug:</strong> onsubmit triggered. Validating fields...</div>\';";
+  html += "      }";
+    html += "      ";
+  html += "      var hasEmpty = false;";
+  html += "      ";
+  html += "      /* Validate g_min and g_max */";
+  html += "      var gMin = form.querySelector(\"input[name=\'g_min\']\");";
+  html += "      var gMax = form.querySelector(\"input[name=\'g_max\']\");";
+  html += "      if (gMin && gMin.value === \'\') {";
+  html += "        hasEmpty = true;";
+  html += "        gMin.style.border = \'2px solid #d9534f\';";
+  html += "        if (dbg) dbg.innerHTML += \'<div>g_min is empty</div>\';";
+  html += "      } else if (gMin) {";
+  html += "        gMin.style.border = \'\';";
+  html += "      }";
+  html += "      if (gMax && gMax.value === \'\') {";
+  html += "        hasEmpty = true;";
+  html += "        gMax.style.border = \'2px solid #d9534f\';";
+  html += "        if (dbg) dbg.innerHTML += \'<div>g_max is empty</div>\';";
+  html += "      } else if (gMax) {";
+  html += "        gMax.style.border = \'\';";
+  html += "      }";
+  html += "      var gIndLow = form.querySelector(\"input[name=\'g_ind_low\']\");";
+  html += "      var gIndHigh = form.querySelector(\"input[name=\'g_ind_high\']\");";
+  html += "      if (gIndLow && gIndLow.value === \'\') {";
+  html += "        hasEmpty = true;";
+  html += "        gIndLow.style.border = \'2px solid #d9534f\';";
+  html += "        if (dbg) dbg.innerHTML += \'<div>g_ind_low is empty</div>\';";
+  html += "      } else if (gIndLow) {";
+  html += "        gIndLow.style.border = \'\';";
+  html += "      }";
+  html += "      if (gIndHigh && gIndHigh.value === \'\') {";
+  html += "        hasEmpty = true;";
+  html += "        gIndHigh.style.border = \'2px solid #d9534f\';";
+  html += "        if (dbg) dbg.innerHTML += \'<div>g_ind_high is empty</div>\';";
+  html += "      } else if (gIndHigh) {";
+  html += "        gIndHigh.style.border = \'\';";
+  html += "      }";
+  html += "      ";
+  html += "      /* Validate rules */";
+  html += "      var rows = form.querySelectorAll(\'.rule-row\');";
+  html += "      rows.forEach(function(row, idx) {";
+  html += "        var enCheckbox = row.querySelector(\'.en-checkbox\');";
+  html += "        if (enCheckbox && !enCheckbox.checked) return;";
+  html += "        ";
+  html += "        var typeEl = row.querySelector(\'.type-select\');";
+  html += "        var type = typeEl ? typeEl.value : \'\';";
+  html += "        var val1 = row.querySelector(\'.val1-input\');";
+  html += "        var val2 = row.querySelector(\'.val2-input\');";
+  html += "        var duration = row.querySelector(\'.duration-input\');";
+  html += "        ";
+  html += "        if (val1 && val1.value === \'\') {";
+  html += "          hasEmpty = true;";
+  html += "          val1.style.border = \'2px solid #d9534f\';";
+  html += "          if (dbg) dbg.innerHTML += \'<div>Rule #\' + (idx+1) + \' limit/val1 is empty</div>\';";
+  html += "        } else if (val1) {";
+  html += "          val1.style.border = \'\';";
+  html += "        }";
+  html += "        ";
+  html += "        if ((type === \'between\' || type === \'drop\' || type === \'rise\') && val2 && val2.value === \'\') {";
+  html += "          hasEmpty = true;";
+  html += "          val2.style.border = \'2px solid #d9534f\';";
+  html += "          if (dbg) dbg.innerHTML += \'<div>Rule #\' + (idx+1) + \' val2 is empty</div>\';";
+  html += "        } else if (val2) {";
+  html += "          val2.style.border = \'\';";
+  html += "        }";
+  html += "        ";
+  html += "        if ((type === \'drop\' || type === \'rise\') && duration && (duration.value === \'\' || parseInt(duration.value) < 1)) {";
+  html += "          hasEmpty = true;";
+  html += "          duration.style.border = \'2px solid #d9534f\';";
+  html += "          if (dbg) dbg.innerHTML += \'<div>Rule #\' + (idx+1) + \' duration is empty</div>\';";
+  html += "        } else if (duration) {";
+  html += "          duration.style.border = \'\';";
+  html += "        }";
+  html += "      });";
+  html += "      ";
+  html += "      if (hasEmpty) {";
+  html += "        var details = form.querySelectorAll(\'details\');";
+  html += "        details.forEach(function(d) { d.open = true; });";
+  html += "        alert(\'Please fill in all required alert fields.\');";
+  html += "        if (dbg) dbg.innerHTML += \'<div><strong>Validation Failed</strong></div>\';";
+  html += "        e.preventDefault();";
+  html += "        return false;";
+  html += "      }";
+  html += "      ";
+  html += "      if (dbg) dbg.innerHTML += \'<div><strong>Validation Passed. Submitting...</strong></div>\';";
+  html += "      return true;";
+  html += "    };";
+  html += "  }";
+html += "  reindexRules();";
   html += "};";
   html += "</script>";
   
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  localServer.sendHeader("Pragma", "no-cache");
+  localServer.sendHeader("Expires", "-1");
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalSaveGeneralPost() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
   
-  if (localServer.hasArg("units") && localServer.hasArg("c_low") && localServer.hasArg("w_low") && localServer.hasArg("w_high") && localServer.hasArg("c_high") && localServer.hasArg("g_min") && localServer.hasArg("g_max")) {
+  if (localServer.hasArg("units") && localServer.hasArg("g_min") && localServer.hasArg("g_max")) {
     String units = localServer.arg("units");
     units.toCharArray(llu_units, sizeof(llu_units));
     
-    float user_c_low = localServer.arg("c_low").toFloat();
-    float user_w_low = localServer.arg("w_low").toFloat();
-    float user_w_high = localServer.arg("w_high").toFloat();
-    float user_c_high = localServer.arg("c_high").toFloat();
     float user_g_min = localServer.arg("g_min").toFloat();
     float user_g_max = localServer.arg("g_max").toFloat();
-
-    c_low = fromUserUnit(user_c_low);
-    w_low = fromUserUnit(user_w_low);
-    w_high = fromUserUnit(user_w_high);
-    c_high = fromUserUnit(user_c_high);
+    
     graph_min = fromUserUnit(user_g_min);
     graph_max = fromUserUnit(user_g_max);
-
-    // Parse message rules from POST
+    
+    if (localServer.hasArg("g_ind_low")) {
+      graph_indicator_low = fromUserUnit(localServer.arg("g_ind_low").toFloat());
+    }
+    if (localServer.hasArg("g_ind_high")) {
+      graph_indicator_high = fromUserUnit(localServer.arg("g_ind_high").toFloat());
+    }
+    
+    show_delta = localServer.hasArg("show_delta");
+    show_delta5 = localServer.hasArg("show_delta5");
+    if (localServer.hasArg("delta_n_count")) {
+      delta_n_count = localServer.arg("delta_n_count").toInt();
+      if (delta_n_count < 1) delta_n_count = 5;
+    }
+    
+    // Parse alert rules from POST
     int rule_idx = 0;
     for (int i = 0; i < 10; i++) {
-      String type_key = "msg_type_" + String(i);
+      String type_key = "alert_type_" + String(i);
       if (localServer.hasArg(type_key)) {
         String type = localServer.arg(type_key);
-        float val1 = localServer.arg("msg_val1_" + String(i)).toFloat();
-        float val2 = localServer.arg("msg_val2_" + String(i)).toFloat();
-        String text = localServer.arg("msg_text_" + String(i));
-        text.trim();
+        float val1 = localServer.arg("alert_val1_" + String(i)).toFloat();
+        float val2 = localServer.arg("alert_val2_" + String(i)).toFloat();
+        int duration = localServer.arg("alert_duration_" + String(i)).toInt();
+        String color = localServer.arg("alert_color_" + String(i));
+        String msg = localServer.arg("alert_msg_" + String(i));
+        bool enabled = localServer.hasArg("alert_en_" + String(i));
+        msg.trim();
         
-        if (text.length() > 0) {
-          strncpy(msg_rules[rule_idx].type, type.c_str(), sizeof(msg_rules[rule_idx].type));
-          msg_rules[rule_idx].val1 = fromUserUnit(val1);
-          msg_rules[rule_idx].val2 = fromUserUnit(val2);
-          strncpy(msg_rules[rule_idx].text, text.c_str(), sizeof(msg_rules[rule_idx].text));
-          rule_idx++;
-        }
+        strncpy(alert_rules[rule_idx].type, type.c_str(), sizeof(alert_rules[rule_idx].type));
+        alert_rules[rule_idx].val1 = fromUserUnit(val1);
+        alert_rules[rule_idx].val2 = fromUserUnit(val2);
+        alert_rules[rule_idx].duration_min = duration;
+        strncpy(alert_rules[rule_idx].color, color.c_str(), sizeof(alert_rules[rule_idx].color));
+        strncpy(alert_rules[rule_idx].message, msg.c_str(), sizeof(alert_rules[rule_idx].message));
+        alert_rules[rule_idx].enabled = enabled;
+        rule_idx++;
       }
     }
     if (rule_idx < 10) {
-      memset(&msg_rules[rule_idx], 0, (10 - rule_idx) * sizeof(MessageRule));
+      memset(&alert_rules[rule_idx], 0, (10 - rule_idx) * sizeof(AlertRule));
     }
-    msg_rules_count = rule_idx;
-
+    alert_rules_count = rule_idx;
+    
     // Sanitization & bounds checking
-    if (c_low < 30.0) c_low = 30.0;
-    if (w_low < c_low) w_low = c_low;
-    if (w_high < w_low) w_high = w_low;
-    if (c_high < w_high) c_high = w_high;
     if (graph_min < 30.0) graph_min = 30.0;
     if (graph_max < graph_min) graph_max = graph_min + 50.0;
+    if (graph_indicator_low < 30.0) graph_indicator_low = 30.0;
+    if (graph_indicator_high < 30.0) graph_indicator_high = 30.0;
+    
+    // Update computed thresholds for the graph lines
+    updateGraphThresholdsFromRules();
     
     Preferences preferences;
     preferences.begin("cgm-config", false);
     preferences.putString("units", llu_units);
-    preferences.putFloat("c_low", c_low);
-    preferences.putFloat("w_low", w_low);
-    preferences.putFloat("w_high", w_high);
-    preferences.putFloat("c_high", c_high);
+    preferences.putBool("show_delta", show_delta);
+    preferences.putBool("show_delta5", show_delta5);
+    preferences.putInt("delta_n_cnt", delta_n_count);
     preferences.putFloat("g_min", graph_min);
     preferences.putFloat("g_max", graph_max);
-    preferences.putBytes("msg_rules", msg_rules, sizeof(msg_rules));
-    preferences.putInt("msg_rules_cnt", msg_rules_count);
+    preferences.putFloat("g_ind_low", graph_indicator_low);
+    preferences.putFloat("g_ind_high", graph_indicator_high);
+    preferences.putBytes("alert_rules", alert_rules, sizeof(alert_rules));
+    preferences.putInt("alert_rules_cnt", alert_rules_count);
     preferences.end();
     
     Serial.println("Local web server updated and saved general configuration to NVS.");
     
     drawDashboard();
     
-    String html = "<html><head><meta http-equiv='refresh' content='3;url=/general'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+    String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/general'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
     html += "<h2>Configuration Saved Successfully!</h2>";
     html += "<p>Updating local display thresholds and returning to configuration page...</p>";
     html += "</body></html>";
     
-    localServer.send(200, "text/html", html);
+    localServer.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    localServer.sendHeader("Pragma", "no-cache");
+    localServer.sendHeader("Expires", "-1");
+    localServer.send(200, "text/html; charset=utf-8", html);
   } else {
     localServer.send(400, "text/plain", "Bad Request: Missing parameters");
   }
@@ -2663,25 +3326,45 @@ void handleLocalHardwareGet() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; text-align:center; }";
   html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
   html += "label { display:block; margin-bottom:5px; color:#aaa; font-weight:bold; }";
+  html += "select { width:100%; padding:8px; background:#111; color:#fff; border:1px solid #444; border-radius:4px; box-sizing:border-box; margin-bottom:10px; }";
   html += ".btn { display:block; width:100%; padding:12px; text-align:center; background:#5cb85c; color:#fff; text-decoration:none; border-radius:4px; font-weight:bold; border:none; cursor:pointer; margin-top:20px; font-size:16px; box-sizing:border-box; }";
   html += ".btn-blue { background:#33B5E5; }";
   html += ".btn-orange { background:#f0ad4e; }";
+  html += ".btn-purple { background:#9B59B6; }";
   html += ".btn-red { background:#d9534f; }";
   html += ".btn-grey { background:#555; }";
+  html += ".warn { color:#F0AD4E; font-size:12px; margin-top:5px; }";
   html += "</style></head><body>";
   
   html += "<div class='card'>";
   html += "<h2>Hardware Control</h2>";
   html += "<a href='/update' class='btn btn-blue'>Update Firmware (OTA)</a>";
   html += "<a href='/wifi' class='btn btn-blue'>Network & Wi-Fi Settings</a>";
+  html += "<a href='/mqtt' class='btn btn-purple'>MQTT / Home Assistant</a>";
   html += "<a href='/debug-info' class='btn btn-blue'>Debug Info</a>";
   html += "<a href='/reboot' class='btn btn-red' onclick='return confirm(\"Are you sure you want to reboot the device?\");'>Reboot Device</a>";
   html += "<a href='/factory-reset' class='btn btn-red' style='margin-top:40px;' onclick='return confirm(\"Are you sure you want to perform a factory reset? This will erase all Wi-Fi, password, settings and historical readings, and require a full reconfiguration.\");'>Reset to Factory Default</a>";
+  html += "</div>";
+  
+  // Display Settings card
+  html += "<div class='card'>";
+  html += "<h2>Display Settings</h2>";
+  html += "<form action='/save-display' method='POST'>";
+  html += "<label>Display Rotation</label>";
+  html += "<select name='disp_rot'>";
+  html += "<option value='0'" + String(display_rotation == 0 ? " selected" : "") + ">0° (Default)</option>";
+  html += "<option value='1'" + String(display_rotation == 1 ? " selected" : "") + ">90°</option>";
+  html += "<option value='2'" + String(display_rotation == 2 ? " selected" : "") + ">180°</option>";
+  html += "<option value='3'" + String(display_rotation == 3 ? " selected" : "") + ">270°</option>";
+  html += "</select>";
+  html += "<p class='warn'>⚠ Changing rotation will reboot the device to apply.</p>";
+  html += "<button type='submit' class='btn btn-orange' onclick='return confirm(\"Changing display rotation will reboot the device. Continue?\");'>Save & Reboot</button>";
+  html += "</form>";
   html += "</div>";
   
   html += "<div class='card'>";
@@ -2696,7 +3379,7 @@ void handleLocalHardwareGet() {
   
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 const char* getResetReasonStr(esp_reset_reason_t reason) {
@@ -2842,7 +3525,7 @@ void handleLocalDebugGet() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
 
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; margin:0; }";
   html += ".container { max-width:800px; margin:0 auto; text-align:left; }";
   html += "h2 { color:#33B5E5; text-align:center; margin-bottom:20px; }";
@@ -2955,7 +3638,7 @@ void handleLocalDebugGet() {
 
   // Diabetes:M Heartbeat Logs collapsible
   if (dm_enable_heartbeat) {
-    html += "<details class='card'><summary style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:16px;'>Show Last 10 Diabetes:M Heartbeat Logs</summary>";
+    html += "<details class='card'><h3 style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:16px;'>Show Last 10 Diabetes:M Heartbeat Logs</h3>";
     html += "<table style='width:100%;border-collapse:collapse;margin-top:10px;font-size:14px;border:none;'>";
     html += "<thead><tr style='border-bottom:1px solid #444;text-align:left;'><th style='padding:5px;background:none;width:auto;'>Time</th><th style='padding:5px;background:none;width:auto;'>Status</th></tr></thead>";
     html += "<tbody>";
@@ -2970,11 +3653,11 @@ void handleLocalDebugGet() {
         html += "</tr>";
       }
     }
-    html += "</tbody></table></details>";
+    html += "</tbody></table></div>";
   }
 
   // Diabetes:M Logs collapsible
-  html += "<details class='card'><summary style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:16px;'>Show Last 10 Diabetes:M Sync Attempts</summary>";
+  html += "<details class='card'><h3 style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:16px;'>Show Last 10 Diabetes:M Sync Attempts</h3>";
   html += "<table style='width:100%;border-collapse:collapse;margin-top:10px;font-size:14px;border:none;'>";
   html += "<thead><tr style='border-bottom:1px solid #444;text-align:left;'><th style='padding:5px;background:none;width:auto;'>Time</th><th style='padding:5px;background:none;width:auto;'>Glucose</th><th style='padding:5px;background:none;width:auto;'>Status</th></tr></thead>";
   html += "<tbody>";
@@ -2996,12 +3679,12 @@ void handleLocalDebugGet() {
       html += "</tr>";
     }
   }
-  html += "</tbody></table></details>";
+  html += "</tbody></table></div>";
 
   html += "<a href='/hardware' class='btn btn-grey'>Back to Hardware Control</a>";
   html += "</div></body></html>";
 
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 String obfuscate(const String &input) {
@@ -3034,28 +3717,33 @@ String deobfuscate(const String &input) {
 void handleLocalExportConfig() {
   if (!checkAuth()) return;
   
-  DynamicJsonDocument doc(8192);
+  DynamicJsonDocument doc(10240);
   doc["device_name"] = device_name;
   doc["email"] = llu_email;
   doc["password"] = obfuscate(llu_password);
   doc["region"] = llu_region;
   doc["poll"] = llu_poll_interval;
   doc["units"] = llu_units;
-  
-  doc["c_low"] = toUserUnit(c_low);
-  doc["w_low"] = toUserUnit(w_low);
-  doc["w_high"] = toUserUnit(w_high);
-  doc["c_high"] = toUserUnit(c_high);
   doc["g_min"] = toUserUnit(graph_min);
   doc["g_max"] = toUserUnit(graph_max);
+  doc["g_ind_low"] = toUserUnit(graph_indicator_low);
+  doc["g_ind_high"] = toUserUnit(graph_indicator_high);
   
-  JsonArray rules_arr = doc.createNestedArray("msg_rules");
-  for (int i = 0; i < msg_rules_count; i++) {
+  doc["llu_show_trend"] = llu_show_trend;
+  doc["show_delta"] = show_delta;
+  doc["show_delta5"] = show_delta5;
+  doc["delta_n_count"] = delta_n_count;
+  
+  JsonArray rules_arr = doc.createNestedArray("alert_rules");
+  for (int i = 0; i < alert_rules_count; i++) {
     JsonObject rule_obj = rules_arr.createNestedObject();
-    rule_obj["type"] = msg_rules[i].type;
-    rule_obj["val1"] = toUserUnit(msg_rules[i].val1);
-    rule_obj["val2"] = toUserUnit(msg_rules[i].val2);
-    rule_obj["text"] = msg_rules[i].text;
+    rule_obj["type"] = alert_rules[i].type;
+    rule_obj["val1"] = toUserUnit(alert_rules[i].val1);
+    rule_obj["val2"] = toUserUnit(alert_rules[i].val2);
+    rule_obj["dur"] = alert_rules[i].duration_min;
+    rule_obj["color"] = alert_rules[i].color;
+    rule_obj["msg"] = alert_rules[i].message;
+    rule_obj["en"] = alert_rules[i].enabled;
   }
   
   // Diabetes:M settings
@@ -3106,6 +3794,18 @@ void handleLocalExportConfig() {
     rule_obj["en"] = dm_cat_rules[i].enabled;
   }
   
+  // Display settings
+  doc["disp_rot"] = display_rotation;
+  
+  // MQTT settings
+  doc["mqtt_en"] = mqtt_enabled;
+  doc["mqtt_broker"] = mqtt_broker;
+  doc["mqtt_port"] = mqtt_port;
+  doc["mqtt_user"] = mqtt_user;
+  doc["mqtt_pass"] = obfuscate(mqtt_password);
+  doc["mqtt_prefix"] = mqtt_topic_prefix;
+  doc["mqtt_tls"] = mqtt_use_tls;
+  
   String json_str;
   serializeJson(doc, json_str);
   
@@ -3116,7 +3816,7 @@ void handleLocalExportConfig() {
 void handleLocalImportConfigGet() {
   if (!checkAuth()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; text-align:center; }";
   html += ".card { background:#222; padding:20px; border-radius:8px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
@@ -3161,7 +3861,7 @@ void handleLocalImportConfigGet() {
   html += "</script>";
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalImportConfig() {
@@ -3209,51 +3909,60 @@ void handleLocalImportConfig() {
       String units = doc["units"].as<String>();
       units.toCharArray(llu_units, sizeof(llu_units));
     }
-    if (doc.containsKey("c_low")) {
-      c_low = importVal(doc["c_low"].as<float>());
-    }
-    if (doc.containsKey("w_low")) {
-      w_low = importVal(doc["w_low"].as<float>());
-    }
-    if (doc.containsKey("w_high")) {
-      w_high = importVal(doc["w_high"].as<float>());
-    }
-    if (doc.containsKey("c_high")) {
-      c_high = importVal(doc["c_high"].as<float>());
-    }
     if (doc.containsKey("g_min")) {
       graph_min = importVal(doc["g_min"].as<float>());
     }
     if (doc.containsKey("g_max")) {
       graph_max = importVal(doc["g_max"].as<float>());
     }
+    if (doc.containsKey("g_ind_low")) {
+      graph_indicator_low = importVal(doc["g_ind_low"].as<float>());
+    }
+    if (doc.containsKey("g_ind_high")) {
+      graph_indicator_high = importVal(doc["g_ind_high"].as<float>());
+    }
+    if (doc.containsKey("llu_show_trend")) {
+      llu_show_trend = doc["llu_show_trend"].as<bool>();
+    }
+    if (doc.containsKey("show_delta")) {
+      show_delta = doc["show_delta"].as<bool>();
+    }
+    if (doc.containsKey("show_delta5")) {
+      show_delta5 = doc["show_delta5"].as<bool>();
+    }
+    if (doc.containsKey("delta_n_count")) {
+      delta_n_count = doc["delta_n_count"].as<int>();
+      if (delta_n_count < 1) delta_n_count = 5;
+    }
     
-    if (doc.containsKey("msg_rules")) {
-      JsonArray rules_arr = doc["msg_rules"].as<JsonArray>();
+    if (doc.containsKey("alert_rules")) {
+      JsonArray rules_arr = doc["alert_rules"].as<JsonArray>();
       int rule_idx = 0;
       for (JsonObject rule_obj : rules_arr) {
         if (rule_idx >= 10) break;
-        if (rule_obj.containsKey("type") && rule_obj.containsKey("text")) {
+        if (rule_obj.containsKey("type")) {
           String type = rule_obj["type"].as<String>();
-          float val1 = rule_obj["val1"].as<float>();
-          float val2 = rule_obj["val2"].as<float>();
-          String text = rule_obj["text"].as<String>();
-          text.trim();
+          float val1 = rule_obj.containsKey("val1") ? rule_obj["val1"].as<float>() : 0.0;
+          float val2 = rule_obj.containsKey("val2") ? rule_obj["val2"].as<float>() : 0.0;
+          int dur = rule_obj.containsKey("dur") ? rule_obj["dur"].as<int>() : 0;
+          String color = rule_obj.containsKey("color") ? rule_obj["color"].as<String>() : "Green";
+          String msg = rule_obj.containsKey("msg") ? rule_obj["msg"].as<String>() : "";
+          bool en = rule_obj.containsKey("en") ? rule_obj["en"].as<bool>() : true;
           
-          if (text.length() > 0) {
-            strncpy(msg_rules[rule_idx].type, type.c_str(), sizeof(msg_rules[rule_idx].type));
-            msg_rules[rule_idx].val1 = importVal(val1);
-            msg_rules[rule_idx].val2 = importVal(val2);
-            strncpy(msg_rules[rule_idx].text, text.c_str(), sizeof(msg_rules[rule_idx].text));
-            rule_idx++;
-          }
+          strncpy(alert_rules[rule_idx].type, type.c_str(), sizeof(alert_rules[rule_idx].type));
+          alert_rules[rule_idx].val1 = importVal(val1);
+          alert_rules[rule_idx].val2 = importVal(val2);
+          alert_rules[rule_idx].duration_min = dur;
+          strncpy(alert_rules[rule_idx].color, color.c_str(), sizeof(alert_rules[rule_idx].color));
+          strncpy(alert_rules[rule_idx].message, msg.c_str(), sizeof(alert_rules[rule_idx].message));
+          alert_rules[rule_idx].enabled = en;
+          rule_idx++;
         }
       }
-      
       if (rule_idx < 10) {
-        memset(&msg_rules[rule_idx], 0, (10 - rule_idx) * sizeof(MessageRule));
+        memset(&alert_rules[rule_idx], 0, (10 - rule_idx) * sizeof(AlertRule));
       }
-      msg_rules_count = rule_idx;
+      alert_rules_count = rule_idx;
     }
     
     // Deserialize Diabetes:M settings if present
@@ -3341,14 +4050,18 @@ void handleLocalImportConfig() {
     preferences.putString("region", llu_region);
     preferences.putInt("poll", llu_poll_interval);
     preferences.putString("units", llu_units);
-    preferences.putFloat("c_low", c_low);
-    preferences.putFloat("w_low", w_low);
-    preferences.putFloat("w_high", w_high);
-    preferences.putFloat("c_high", c_high);
+    preferences.putBool("llu_show_trend", llu_show_trend);
+    preferences.putBool("show_delta", show_delta);
+    preferences.putBool("show_delta5", show_delta5);
+    preferences.putInt("delta_n_cnt", delta_n_count);
     preferences.putFloat("g_min", graph_min);
     preferences.putFloat("g_max", graph_max);
-    preferences.putBytes("msg_rules", msg_rules, sizeof(msg_rules));
-    preferences.putInt("msg_rules_cnt", msg_rules_count);
+    preferences.putFloat("g_ind_low", graph_indicator_low);
+    preferences.putFloat("g_ind_high", graph_indicator_high);
+
+    preferences.putBytes("alert_rules", alert_rules, sizeof(alert_rules));
+    preferences.putInt("alert_rules_cnt", alert_rules_count);
+    updateGraphThresholdsFromRules();
     preferences.putString("dev_name", device_name);
     
     // Commit Diabetes:M settings
@@ -3420,6 +4133,49 @@ void handleLocalImportConfig() {
       }
     }
     
+    // Import display rotation
+    if (doc.containsKey("disp_rot")) {
+      display_rotation = doc["disp_rot"].as<int>();
+      if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
+      preferences.putInt("disp_rot", display_rotation);
+    }
+    
+    // Import MQTT settings
+    if (doc.containsKey("mqtt_en")) {
+      mqtt_enabled = doc["mqtt_en"].as<bool>();
+      preferences.putBool("mqtt_en", mqtt_enabled);
+    }
+    if (doc.containsKey("mqtt_broker")) {
+      String broker = doc["mqtt_broker"].as<String>();
+      broker.toCharArray(mqtt_broker, sizeof(mqtt_broker));
+      preferences.putString("mqtt_broker", mqtt_broker);
+    }
+    if (doc.containsKey("mqtt_port")) {
+      mqtt_port = doc["mqtt_port"].as<int>();
+      if (mqtt_port < 1 || mqtt_port > 65535) mqtt_port = 1883;
+      preferences.putInt("mqtt_port", mqtt_port);
+    }
+    if (doc.containsKey("mqtt_user")) {
+      String user = doc["mqtt_user"].as<String>();
+      user.toCharArray(mqtt_user, sizeof(mqtt_user));
+      preferences.putString("mqtt_user", mqtt_user);
+    }
+    if (doc.containsKey("mqtt_pass")) {
+      String pass_obf = doc["mqtt_pass"].as<String>();
+      String pass = deobfuscate(pass_obf);
+      pass.toCharArray(mqtt_password, sizeof(mqtt_password));
+      preferences.putString("mqtt_pass", mqtt_password);
+    }
+    if (doc.containsKey("mqtt_prefix")) {
+      String prefix = doc["mqtt_prefix"].as<String>();
+      prefix.toCharArray(mqtt_topic_prefix, sizeof(mqtt_topic_prefix));
+      preferences.putString("mqtt_prefix", mqtt_topic_prefix);
+    }
+    if (doc.containsKey("mqtt_tls")) {
+      mqtt_use_tls = doc["mqtt_tls"].as<bool>();
+      preferences.putBool("mqtt_tls", mqtt_use_tls);
+    }
+    
     preferences.end();
     
     // Recalculate scheduling
@@ -3431,12 +4187,12 @@ void handleLocalImportConfig() {
     
     drawDashboard();
     
-    String html = "<html><head><meta http-equiv='refresh' content='3;url=/hardware'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+    String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/hardware'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
     html += "<h2>Configuration Imported Successfully!</h2>";
     html += "<p>Updating settings and returning to landing page...</p>";
     html += "</body></html>";
     
-    localServer.send(200, "text/html", html);
+    localServer.send(200, "text/html; charset=utf-8", html);
   } else {
     localServer.send(400, "text/plain", "Bad Request: Missing config_json argument");
   }
@@ -4025,7 +4781,7 @@ void handleLocalDMGet() {
     }
   }
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; text-align:center; }";
   html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
@@ -4124,7 +4880,7 @@ void handleLocalDMGet() {
   html += "</select>";
   html += "</div>";
 
-  html += "<details class='card' style='margin-top:20px;' open><summary style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:18px;'>Configure Category Time Slots (max 24)</summary>";
+  html += "<details class='card' style='margin-top:20px;' open><h3 style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:18px;'>Configure Category Time Slots (max 24)</h3>";
   html += "<div style='margin-top:10px;'>";
   html += "<table id='slots_table' style='width:100%;border-collapse:collapse;'>";
   html += "<thead><tr style='border-bottom:1px solid #444;text-align:left;color:#888;font-size:12px;'>";
@@ -4143,7 +4899,7 @@ void handleLocalDMGet() {
   html += "<button type='button' style='background:#5bc85c;color:#fff;padding:6px 12px;font-size:13px;border:none;border-radius:4px;cursor:pointer;margin:0;flex:1.5;min-width:160px;' onclick='redownloadCategories()'>Redownload Categories</button>";
   html += "</div>";
   html += "</div>";
-  html += "</details>";
+  html += "</div>";
   html += "<input type='hidden' id='dm_cat_rules_json' name='dm_cat_rules_json' value=''>";
   
   html += "<div class='form-group'>";
@@ -4185,7 +4941,7 @@ void handleLocalDMGet() {
   
   // Show Heartbeat Log Collapsible
   if (dm_enable_heartbeat) {
-    html += "<details class='card' style='margin-top:10px;'><summary style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:18px;'>Show Heartbeat Log (Last Succeeded: " + formatLocalTime(dm_last_heartbeat_epoch, "%Y-%m-%d %H:%M:%S") + ")</summary>";
+    html += "<details class='card' style='margin-top:10px;'><h3 style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:18px;'>Show Heartbeat Log (Last Succeeded: " + formatLocalTime(dm_last_heartbeat_epoch, "%Y-%m-%d %H:%M:%S") + ")</h3>";
     html += "<table style='width:100%;border-collapse:collapse;margin-top:10px;font-size:14px;'>";
     html += "<thead><tr style='border-bottom:1px solid #444;text-align:left;'><th style='padding:5px;'>Time</th><th style='padding:5px;'>Status</th></tr></thead>";
     html += "<tbody>";
@@ -4200,11 +4956,11 @@ void handleLocalDMGet() {
         html += "</tr>";
       }
     }
-    html += "</tbody></table></details>";
+    html += "</tbody></table></div>";
   }
 
   // Show Log Collapsible
-  html += "<details class='card' style='margin-top:20px;'><summary style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:18px;'>Show Communication Log</summary>";
+  html += "<details class='card' style='margin-top:20px;'><h3 style='font-weight:bold;cursor:pointer;color:#33B5E5;font-size:18px;'>Show Communication Log</h3>";
   html += "<table style='width:100%;border-collapse:collapse;margin-top:10px;font-size:14px;'>";
   html += "<thead><tr style='border-bottom:1px solid #444;text-align:left;'><th style='padding:5px;'>Time</th><th style='padding:5px;'>Glucose</th><th style='padding:5px;'>Status</th></tr></thead>";
   html += "<tbody>";
@@ -4226,7 +4982,7 @@ void handleLocalDMGet() {
       html += "</tr>";
     }
   }
-  html += "</tbody></table></details>";
+  html += "</tbody></table></div>";
   html += "</div>"; // Close dm_logs_container
   
   // Scripts
@@ -4545,7 +5301,7 @@ void handleLocalDMGet() {
   html += "  document.getElementById('dm_form').submit();\n";
   html += "}";
   html += "</script></body></html>";
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalDMSave() {
@@ -4677,11 +5433,11 @@ void handleLocalDMSave() {
   recalculateNextSendTime();
   drawDashboard();
   
-  String html = "<html><head><meta http-equiv='refresh' content='2;url=/'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='2;url=/'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
   html += "<h2>Configuration Saved Successfully!</h2>";
   html += "<p>Updating settings and returning to landing page...</p>";
   html += "</body></html>";
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalDMTestConnection() {
@@ -4840,12 +5596,363 @@ void handleLocalDMTestUpload() {
     localServer.send(400, "text/plain", "Upload failed: " + upload_err);
   }
 }
+// ==================== MQTT Functions ====================
+
+void mqttReconnect() {
+  if (mqttClient.connected()) return;
+  
+  Serial.printf("[MQTT] Attempting connection to %s:%d...\n", mqtt_broker, mqtt_port);
+  
+  String client_id = "cgm-" + String(device_name);
+  bool connected = false;
+  
+  if (strlen(mqtt_user) > 0) {
+    connected = mqttClient.connect(client_id.c_str(), mqtt_user, mqtt_password);
+  } else {
+    connected = mqttClient.connect(client_id.c_str());
+  }
+  
+  if (connected) {
+    mqtt_connected = true;
+    mqtt_last_status = "Connected";
+    Serial.println("[MQTT] Connected successfully.");
+    
+    // Subscribe to command topics
+    String cmd_prefix = String(mqtt_topic_prefix) + "/cmd/";
+    mqttClient.subscribe((cmd_prefix + "refresh").c_str());
+    mqttClient.subscribe((cmd_prefix + "reboot").c_str());
+    mqttClient.subscribe((cmd_prefix + "message").c_str());
+    Serial.printf("[MQTT] Subscribed to %scmd/*\n", String(mqtt_topic_prefix).c_str());
+    
+    // Publish HA auto-discovery configs
+    mqttPublishDiscovery();
+    
+    // Publish current state immediately
+    mqttPublish();
+  } else {
+    mqtt_connected = false;
+    mqtt_last_status = "Connection failed (rc=" + String(mqttClient.state()) + ")";
+    Serial.printf("[MQTT] Connection failed, rc=%d\n", mqttClient.state());
+  }
+}
+
+void mqttPublish() {
+  if (!mqttClient.connected()) return;
+  
+  String prefix = String(mqtt_topic_prefix) + "/";
+  
+  // Glucose in user units
+  float user_val = last_glucose;
+  if (strcmp(llu_units, "mmol/L") == 0 && last_glucose > 0) {
+    user_val = last_glucose / 18.0182;
+  }
+  
+  mqttClient.publish((prefix + "glucose").c_str(), String(user_val, 1).c_str(), true);
+  mqttClient.publish((prefix + "glucose_mgdl").c_str(), String(last_glucose, 1).c_str(), true);
+  mqttClient.publish((prefix + "trend").c_str(), String(last_trend).c_str(), true);
+  
+  // Trend string
+  const char* trend_names[] = {"", "Falling Fast", "Falling", "Flat", "Rising", "Rising Fast"};
+  const char* trend_str = (last_trend >= 1 && last_trend <= 5) ? trend_names[last_trend] : "Unknown";
+  mqttClient.publish((prefix + "trend_str").c_str(), trend_str, true);
+  
+  mqttClient.publish((prefix + "timestamp").c_str(), last_timestamp.c_str(), true);
+  mqttClient.publish((prefix + "unit").c_str(), llu_units, true);
+  mqttClient.publish((prefix + "wifi_rssi").c_str(), String(WiFi.RSSI()).c_str(), true);
+  mqttClient.publish((prefix + "uptime").c_str(), getUptimeStr().c_str(), true);
+  mqttClient.publish((prefix + "build").c_str(), BUILD_VERSION, true);
+  mqttClient.publish((prefix + "ip").c_str(), WiFi.localIP().toString().c_str(), true);
+  
+  // Online status
+  mqttClient.publish((prefix + "status").c_str(), "online", true);
+  
+  mqtt_last_publish = millis();
+  Serial.printf("[MQTT] Published glucose=%.1f %s, trend=%s\n", user_val, llu_units, trend_str);
+}
+
+void mqttPublishDiscovery() {
+  if (!mqttClient.connected()) return;
+  
+  String dev_id = String(device_name);
+  dev_id.replace(" ", "_");
+  dev_id.toLowerCase();
+  
+  // Device block JSON (shared across all sensors)
+  String device_json = "\"dev\":{\"ids\":[\"" + dev_id + "\"],\"name\":\"" + String(device_name) + "\",\"mf\":\"ESP32\",\"mdl\":\"CGM Display\",\"sw\":\"" BUILD_VERSION "\"}";
+  
+  String prefix = String(mqtt_topic_prefix) + "/";
+  
+  // Helper lambda-like: publish discovery for each sensor
+  struct DiscoverySensor {
+    const char* id;
+    const char* name;
+    const char* topic_suffix;
+    const char* unit;
+    const char* dev_class;
+    const char* icon;
+  };
+  
+  DiscoverySensor sensors[] = {
+    {"glucose", "CGM Glucose", "glucose", "", "", "mdi:diabetes"},
+    {"glucose_mgdl", "CGM Glucose (mg/dL)", "glucose_mgdl", "mg/dL", "", "mdi:diabetes"},
+    {"trend_str", "CGM Trend", "trend_str", "", "", "mdi:trending-up"},
+    {"timestamp", "CGM Last Reading", "timestamp", "", "", "mdi:clock-outline"},
+    {"wifi_rssi", "CGM WiFi Signal", "wifi_rssi", "dBm", "signal_strength", "mdi:wifi"},
+    {"uptime", "CGM Uptime", "uptime", "", "", "mdi:timer-outline"},
+    {"build", "CGM Firmware", "build", "", "", "mdi:information-outline"},
+  };
+  
+  for (auto& s : sensors) {
+    String discovery_topic = "homeassistant/sensor/" + dev_id + "/" + String(s.id) + "/config";
+    
+    DynamicJsonDocument doc(512);
+    doc["name"] = s.name;
+    doc["stat_t"] = prefix + String(s.topic_suffix);
+    doc["uniq_id"] = dev_id + "_" + String(s.id);
+    if (strlen(s.unit) > 0) doc["unit_of_meas"] = s.unit;
+    if (strlen(s.dev_class) > 0) doc["dev_cla"] = s.dev_class;
+    if (strlen(s.icon) > 0) doc["ic"] = s.icon;
+    doc["avty_t"] = prefix + "status";
+    
+    // Add device info
+    JsonObject dev = doc.createNestedObject("dev");
+    dev["ids"][0] = dev_id;
+    dev["name"] = device_name;
+    dev["mf"] = "ESP32";
+    dev["mdl"] = "CGM Display";
+    dev["sw"] = BUILD_VERSION;
+    
+    String payload;
+    serializeJson(doc, payload);
+    
+    mqttClient.publish(discovery_topic.c_str(), payload.c_str(), true);
+  }
+  
+  Serial.println("[MQTT] Published HA auto-discovery configs.");
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String topic_str = String(topic);
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.printf("[MQTT] Received: %s = %s\n", topic, message.c_str());
+  
+  String cmd_prefix = String(mqtt_topic_prefix) + "/cmd/";
+  
+  if (topic_str == cmd_prefix + "refresh") {
+    Serial.println("[MQTT] Refresh command received.");
+    mqtt_force_refresh = true;
+  } else if (topic_str == cmd_prefix + "reboot") {
+    Serial.println("[MQTT] Reboot command received. Rebooting...");
+    String prefix = String(mqtt_topic_prefix) + "/";
+    mqttClient.publish((prefix + "status").c_str(), "rebooting", true);
+    delay(500);
+    ESP.restart();
+  } else if (topic_str == cmd_prefix + "message") {
+    if (message.length() > 0) {
+      Serial.printf("[MQTT] Display message: %s\n", message.c_str());
+      gfx.setFont(&fonts::DejaVu18);
+      gfx.setTextColor(0x33B5E5);
+      gfx.fillRect(0, 300, 480, 30, 0x181A1B);
+      gfx.drawCenterString(message.substring(0, 40), 240, 305);
+    }
+  }
+}
+
+// ==================== MQTT Settings Web Page ====================
+
+void handleLocalMqttGet() {
+  if (!checkAuth()) return;
+  if (checkForceReset()) return;
+  
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
+  html += "h2 { color:#33B5E5; text-align:center; }";
+  html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
+  html += "label { display:block; margin-bottom:5px; color:#aaa; font-weight:bold; }";
+  html += "input[type=text], input[type=password], input[type=number] { width:100%; padding:8px; background:#111; color:#fff; border:1px solid #444; border-radius:4px; box-sizing:border-box; margin-bottom:10px; }";
+  html += "input[type=checkbox] { margin-right:8px; }";
+  html += ".check-label { display:flex; align-items:center; color:#ccc; margin-bottom:10px; }";
+  html += ".btn { display:block; width:100%; padding:12px; text-align:center; background:#5cb85c; color:#fff; text-decoration:none; border-radius:4px; font-weight:bold; border:none; cursor:pointer; margin-top:20px; font-size:16px; box-sizing:border-box; }";
+  html += ".btn-blue { background:#33B5E5; }";
+  html += ".btn-grey { background:#555; }";
+  html += ".info { background:#1a2a3a; border:1px solid #33B5E5; border-radius:4px; padding:10px; margin-bottom:15px; color:#8cb4d0; font-size:13px; }";
+  html += ".status { margin-top:10px; padding:8px; border-radius:4px; font-size:13px; }";
+  html += ".status-ok { background:#1a3a1a; border:1px solid #5cb85c; color:#5cb85c; }";
+  html += ".status-err { background:#3a1a1a; border:1px solid #d9534f; color:#d9534f; }";
+  html += ".status-off { background:#2a2a2a; border:1px solid #555; color:#888; }";
+  html += "</style></head><body>";
+  
+  html += "<form action='/save-mqtt' method='POST'>";
+  html += "<div class='card'>";
+  html += "<h2>MQTT / Home Assistant</h2>";
+  
+  html += "<div class='info'>MQTT allows this device to publish glucose data to Home Assistant or any MQTT broker. ";
+  html += "Sensors are auto-discovered by Home Assistant. The device also listens for commands on <b>" + String(mqtt_topic_prefix) + "/cmd/*</b></div>";
+  
+  // Status indicator
+  if (!mqtt_enabled) {
+    html += "<div class='status status-off'>MQTT is disabled</div>";
+  } else if (mqtt_connected && mqttClient.connected()) {
+    html += "<div class='status status-ok'>✓ Connected to " + String(mqtt_broker) + ":" + String(mqtt_port) + "</div>";
+  } else {
+    html += "<div class='status status-err'>✗ " + mqtt_last_status + "</div>";
+  }
+  
+  html += "<br><label class='check-label'><input type='checkbox' name='mqtt_en' value='1'" + String(mqtt_enabled ? " checked" : "") + "> Enable MQTT</label>";
+  
+  html += "<label>Broker Address</label>";
+  html += "<input type='text' name='mqtt_broker' value='" + String(mqtt_broker) + "' placeholder='e.g. 192.168.1.100 or mqtt.example.com'>";
+  
+  html += "<label>Broker Port</label>";
+  html += "<input type='number' name='mqtt_port' value='" + String(mqtt_port) + "' min='1' max='65535'>";
+  
+  html += "<label class='check-label'><input type='checkbox' name='mqtt_tls' value='1'" + String(mqtt_use_tls ? " checked" : "") + "> Enable TLS (secure connection)</label>";
+  
+  html += "<label>Username (optional)</label>";
+  html += "<input type='text' name='mqtt_user' value='" + String(mqtt_user) + "' placeholder='Leave blank for anonymous'>";
+  
+  html += "<label>Password (optional)</label>";
+  html += "<input type='password' name='mqtt_pass' value='" + String(mqtt_password) + "'>";
+  
+  html += "<label>Topic Prefix</label>";
+  html += "<input type='text' name='mqtt_prefix' value='" + String(mqtt_topic_prefix) + "' placeholder='cgm'>";
+  
+  html += "<div class='info' style='margin-top:15px;'><b>Published topics:</b><br>";
+  html += String(mqtt_topic_prefix) + "/glucose — Current reading in user units<br>";
+  html += String(mqtt_topic_prefix) + "/glucose_mgdl — Reading in mg/dL<br>";
+  html += String(mqtt_topic_prefix) + "/trend_str — Trend direction<br>";
+  html += String(mqtt_topic_prefix) + "/timestamp — Last reading time<br>";
+  html += String(mqtt_topic_prefix) + "/status — Online status<br>";
+  html += "<br><b>Command topics (subscribe):</b><br>";
+  html += String(mqtt_topic_prefix) + "/cmd/refresh — Force glucose poll<br>";
+  html += String(mqtt_topic_prefix) + "/cmd/reboot — Reboot device<br>";
+  html += String(mqtt_topic_prefix) + "/cmd/message — Show text on display</div>";
+  
+  html += "<button type='submit' class='btn'>Save MQTT Settings</button>";
+  html += "</div>";
+  html += "</form>";
+  
+  html += "<div style='max-width:600px; margin-left:auto; margin-right:auto;'>";
+  html += "<a href='/hardware' class='btn btn-grey'>Back to Hardware Control</a>";
+  html += "</div>";
+  
+  html += "</body></html>";
+  
+  localServer.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleLocalMqttSave() {
+  if (!checkAuth()) return;
+  
+  mqtt_enabled = localServer.hasArg("mqtt_en");
+  mqtt_use_tls = localServer.hasArg("mqtt_tls");
+  
+  if (localServer.hasArg("mqtt_broker")) {
+    String broker = localServer.arg("mqtt_broker");
+    broker.trim();
+    broker.toCharArray(mqtt_broker, sizeof(mqtt_broker));
+  }
+  if (localServer.hasArg("mqtt_port")) {
+    mqtt_port = localServer.arg("mqtt_port").toInt();
+    if (mqtt_port < 1 || mqtt_port > 65535) mqtt_port = 1883;
+  }
+  if (localServer.hasArg("mqtt_user")) {
+    String user = localServer.arg("mqtt_user");
+    user.trim();
+    user.toCharArray(mqtt_user, sizeof(mqtt_user));
+  }
+  if (localServer.hasArg("mqtt_pass")) {
+    String pass = localServer.arg("mqtt_pass");
+    pass.toCharArray(mqtt_password, sizeof(mqtt_password));
+  }
+  if (localServer.hasArg("mqtt_prefix")) {
+    String prefix = localServer.arg("mqtt_prefix");
+    prefix.trim();
+    if (prefix.length() == 0) prefix = "cgm";
+    prefix.toCharArray(mqtt_topic_prefix, sizeof(mqtt_topic_prefix));
+  }
+  
+  // Save to NVS
+  Preferences preferences;
+  preferences.begin("cgm-config", false);
+  preferences.putBool("mqtt_en", mqtt_enabled);
+  preferences.putString("mqtt_broker", mqtt_broker);
+  preferences.putInt("mqtt_port", mqtt_port);
+  preferences.putString("mqtt_user", mqtt_user);
+  preferences.putString("mqtt_pass", mqtt_password);
+  preferences.putString("mqtt_prefix", mqtt_topic_prefix);
+  preferences.putBool("mqtt_tls", mqtt_use_tls);
+  preferences.end();
+  
+  // Disconnect existing connection so it reconnects with new settings
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+  mqtt_connected = false;
+  mqtt_last_reconnect_attempt = 0;
+  
+  // Reconfigure client
+  if (mqtt_enabled && strlen(mqtt_broker) > 0) {
+    if (mqtt_use_tls) {
+      mqttWifiClientSecure.setInsecure();
+      mqttClient.setClient(mqttWifiClientSecure);
+    } else {
+      mqttClient.setClient(mqttWifiClient);
+    }
+    mqttClient.setServer(mqtt_broker, mqtt_port);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setBufferSize(512);
+    mqtt_last_status = "Reconnecting...";
+  } else {
+    mqtt_last_status = "Not configured";
+  }
+  
+  Serial.printf("[MQTT] Settings saved. Enabled: %d, Broker: %s:%d, TLS: %d\n", mqtt_enabled, mqtt_broker, mqtt_port, mqtt_use_tls);
+  
+  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/mqtt'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+  html += "<h2>MQTT Settings Saved!</h2>";
+  html += "<p>Returning to MQTT configuration page...</p>";
+  html += "</body></html>";
+  
+  localServer.send(200, "text/html; charset=utf-8", html);
+}
+
+// ==================== Display Settings Save ====================
+
+void handleLocalDisplaySave() {
+  if (!checkAuth()) return;
+  
+  if (localServer.hasArg("disp_rot")) {
+    display_rotation = localServer.arg("disp_rot").toInt();
+    if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
+  }
+  
+  Preferences preferences;
+  preferences.begin("cgm-config", false);
+  preferences.putInt("disp_rot", display_rotation);
+  preferences.end();
+  
+  Serial.printf("Display rotation saved: %d. Rebooting...\n", display_rotation);
+  
+  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='5;url=/hardware'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+  html += "<h2>Display Settings Saved!</h2>";
+  html += "<p>The device will reboot to apply the new rotation...</p>";
+  html += "</body></html>";
+  
+  localServer.send(200, "text/html; charset=utf-8", html);
+  delay(1000);
+  ESP.restart();
+}
 
 void handleLocalWifiGet() {
   if (!checkAuth()) return;
   if (checkForceReset()) return;
   
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
   html += "body { font-family:sans-serif; background:#181a1b; color:#fff; padding:20px; text-align:center; }";
   html += "h2 { color:#33B5E5; text-align:center; }";
   html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
@@ -4896,7 +6003,7 @@ void handleLocalWifiGet() {
   
   html += "</body></html>";
   
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleLocalWifiSave() {
@@ -4928,12 +6035,12 @@ void handleLocalWifiSave() {
     }
   }
   
-  String html = "<html><head><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+  String html = "<html><head><meta charset='utf-8'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
   html += "<h2>WiFi Settings Saved!</h2>";
   html += "<p>The device is restarting to connect to the new network / apply the new device name.</p>";
   html += "<p>Portal will close. Please reconnect your client to the same network and lookup the device.</p>";
   html += "</body></html>";
-  localServer.send(200, "text/html", html);
+  localServer.send(200, "text/html; charset=utf-8", html);
   
   delay(2000);
   ESP.restart();
