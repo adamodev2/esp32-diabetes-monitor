@@ -52,7 +52,6 @@ This includes:
 *   **Touch Controller**: GT911 capacitive touch panel.
 *   **Display Library**: LovyanGFX configuration file for ST7701 & GT911.
 
-
 ---
 
 ## 📸 Web Admin Portal Screenshots
