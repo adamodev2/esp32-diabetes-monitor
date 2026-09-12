@@ -1,0 +1,55 @@
+name: Build ESP32 firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-platformio-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-platformio-
+
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Collect firmware files
+        run: |
+          mkdir -p dist
+          cp .pio/build/esp32-s3-devkitc-1/bootloader.bin dist/
+          cp .pio/build/esp32-s3-devkitc-1/partitions.bin dist/
+          cp .pio/build/esp32-s3-devkitc-1/firmware.bin dist/
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-diabetes-monitor-firmware
+          path: dist/*.bin
+          if-no-files-found: error
+          retention-days: 30
