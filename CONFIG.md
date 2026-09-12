@@ -103,7 +103,7 @@ If you track your data in Diabetes:M, you can configure the device to automatica
 
 Navigate to the **Hardware Control** (`/hardware`) page to manage administrative commands.
 
-*   **Display Brightness**: Use the 5-100% slider under **Display Settings**, then click **Save Display Settings**. Brightness changes immediately and is restored after reboot.
+*   **Display Brightness**: Use the 1-100% slider under **Display Settings**, then click **Save Display Settings**. Brightness changes immediately and is restored after reboot.
 *   **Display Rotation**: Select the screen orientation under **Display Settings**. Saving a changed rotation reboots the device so the new orientation can be applied.
 *   **Save Configuration**: Click this to download a `cgm_config.json` backup file of all your portal settings (tolerances, accounts, custom rules). Passwords are cipher-obfuscated inside the file.
 *   **Load Configuration**: Click this to upload your JSON backup file, and restore your configurations.

@@ -5,7 +5,7 @@ All notable changes to the ESP32 CGM Display project.
 ## [1.0.43]
 
 ### Added
-- **Web-configurable display brightness**: Added a 5-100% brightness slider to Hardware Control. The setting is stored in NVS and restored after reboot.
+- **Web-configurable display brightness**: Added a 1-100% brightness slider with 1% increments to Hardware Control. The setting is stored in NVS and restored after reboot.
 - **Brightness backup and restore**: Display brightness is included in configuration exports and imports.
 
 ### Changed

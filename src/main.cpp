@@ -71,7 +71,7 @@ int dm_d_end = 1170;
 bool dm_2fa_pending = false;
 char device_name[32] = "ESP32-CGM-Display";
 int display_rotation = 0;  // 0=0°, 1=90°, 2=180°, 3=270°
-int display_brightness = 100;  // Percentage, 5-100
+int display_brightness = 100;  // Percentage, 1-100
 
 // MQTT configuration
 bool mqtt_enabled = false;
@@ -494,7 +494,7 @@ bool checkAuth();
 bool checkForceReset();
 
 void applyDisplayBrightness() {
-  display_brightness = constrain(display_brightness, 5, 100);
+  display_brightness = constrain(display_brightness, 1, 100);
   gfx.setBrightness(map(display_brightness, 0, 100, 0, 255));
 }
 
@@ -674,7 +674,7 @@ void loadPreferences() {
   display_rotation = preferences.getInt("disp_rot", 0);
   if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
   display_brightness = preferences.getInt("disp_bri", 100);
-  display_brightness = constrain(display_brightness, 5, 100);
+  display_brightness = constrain(display_brightness, 1, 100);
   
   // Load MQTT settings
   mqtt_enabled = preferences.getBool("mqtt_en", false);
@@ -1222,7 +1222,7 @@ void setup() {
     display_rotation = preferences.getInt("disp_rot", 0);
     if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
     display_brightness = preferences.getInt("disp_bri", 100);
-    display_brightness = constrain(display_brightness, 5, 100);
+    display_brightness = constrain(display_brightness, 1, 100);
     preferences.end();
   }
   
@@ -3372,7 +3372,7 @@ void handleLocalHardwareGet() {
   html += "<option value='3'" + String(display_rotation == 3 ? " selected" : "") + ">270°</option>";
   html += "</select>";
   html += "<label>Brightness: <span id='brightness-value'>" + String(display_brightness) + "</span>%</label>";
-  html += "<input type='range' name='disp_bri' min='5' max='100' step='5' value='" + String(display_brightness) + "' oninput=\"document.getElementById('brightness-value').textContent=this.value\">";
+  html += "<input type='range' name='disp_bri' min='1' max='100' step='1' value='" + String(display_brightness) + "' oninput=\"document.getElementById('brightness-value').textContent=this.value\">";
   html += "<p class='warn'>Changing rotation will reboot the device. Brightness is applied when saved.</p>";
   html += "<button type='submit' class='btn btn-orange'>Save Display Settings</button>";
   html += "</form>";
@@ -4153,7 +4153,7 @@ void handleLocalImportConfig() {
     }
     if (doc.containsKey("disp_bri")) {
       display_brightness = doc["disp_bri"].as<int>();
-      display_brightness = constrain(display_brightness, 5, 100);
+      display_brightness = constrain(display_brightness, 1, 100);
       preferences.putInt("disp_bri", display_brightness);
       applyDisplayBrightness();
     }
@@ -5952,7 +5952,7 @@ void handleLocalDisplaySave() {
   }
   if (localServer.hasArg("disp_bri")) {
     display_brightness = localServer.arg("disp_bri").toInt();
-    display_brightness = constrain(display_brightness, 5, 100);
+    display_brightness = constrain(display_brightness, 1, 100);
   }
   bool rotation_changed = display_rotation != previous_rotation;
   

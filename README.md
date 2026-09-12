@@ -23,7 +23,7 @@ This project allows you to use a simple ESP32-S3 powered display to act as a Lib
 
 ## Changes in this fork (v1.0.43)
 
-*   Added a **5-100% display brightness slider** to the Hardware Control web page.
+*   Added a **1-100% display brightness slider** with 1% increments to the Hardware Control web page.
 *   Brightness is applied immediately, saved in NVS, restored after reboot, and included in configuration backup/restore.
 *   Enabled hardware PWM backlight control on GPIO 38 while keeping display rotation support.
 *   Added a **GitHub Actions** workflow that builds the ESP32 firmware and provides `bootloader.bin`, `partitions.bin`, and `firmware.bin` as downloadable artifacts.
