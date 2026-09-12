@@ -16,7 +16,7 @@ LGFX gfx;
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.42"
+#define BUILD_VERSION "1.0.43"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -71,6 +71,7 @@ int dm_d_end = 1170;
 bool dm_2fa_pending = false;
 char device_name[32] = "ESP32-CGM-Display";
 int display_rotation = 0;  // 0=0°, 1=90°, 2=180°, 3=270°
+int display_brightness = 100;  // Percentage, 5-100
 
 // MQTT configuration
 bool mqtt_enabled = false;
@@ -484,12 +485,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void handleLocalMqttGet();
 void handleLocalMqttSave();
 void handleLocalDisplaySave();
+void applyDisplayBrightness();
 
 
 
 
 bool checkAuth();
 bool checkForceReset();
+
+void applyDisplayBrightness() {
+  display_brightness = constrain(display_brightness, 5, 100);
+  gfx.setBrightness(map(display_brightness, 0, 100, 0, 255));
+}
 
 void saveConfigCallback() {
   Serial.println("WiFiManager config saved callback triggered.");
@@ -666,6 +673,8 @@ void loadPreferences() {
   // Load display rotation
   display_rotation = preferences.getInt("disp_rot", 0);
   if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
+  display_brightness = preferences.getInt("disp_bri", 100);
+  display_brightness = constrain(display_brightness, 5, 100);
   
   // Load MQTT settings
   mqtt_enabled = preferences.getBool("mqtt_en", false);
@@ -1206,22 +1215,21 @@ void setup() {
   Serial.begin(115200);
   Serial.printf("Firmware signature: %s\n", ota_signature);
   
-  // Quick load display rotation from NVS before initializing display
+  // Quick load display settings from NVS before initializing display
   {
     Preferences preferences;
     preferences.begin("cgm-config", true);
     display_rotation = preferences.getInt("disp_rot", 0);
     if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
+    display_brightness = preferences.getInt("disp_bri", 100);
+    display_brightness = constrain(display_brightness, 5, 100);
     preferences.end();
   }
   
   // Initialize the LovyanGFX display
   gfx.init();
   gfx.setRotation(display_rotation);
-  
-  // Set backlight pin GPIO 38 as output and turn it ON
-  pinMode(38, OUTPUT);
-  digitalWrite(38, HIGH);
+  applyDisplayBrightness();
   
   // Render splash screen
   drawSplashScreen();
@@ -3332,6 +3340,7 @@ void handleLocalHardwareGet() {
   html += ".card { background:#222; padding:15px; border-radius:8px; margin-bottom:20px; border:1px solid #333; text-align:left; max-width:600px; margin-left:auto; margin-right:auto; box-sizing:border-box; }";
   html += "label { display:block; margin-bottom:5px; color:#aaa; font-weight:bold; }";
   html += "select { width:100%; padding:8px; background:#111; color:#fff; border:1px solid #444; border-radius:4px; box-sizing:border-box; margin-bottom:10px; }";
+  html += "input[type=range] { width:100%; margin:8px 0 18px; accent-color:#33B5E5; }";
   html += ".btn { display:block; width:100%; padding:12px; text-align:center; background:#5cb85c; color:#fff; text-decoration:none; border-radius:4px; font-weight:bold; border:none; cursor:pointer; margin-top:20px; font-size:16px; box-sizing:border-box; }";
   html += ".btn-blue { background:#33B5E5; }";
   html += ".btn-orange { background:#f0ad4e; }";
@@ -3362,8 +3371,10 @@ void handleLocalHardwareGet() {
   html += "<option value='2'" + String(display_rotation == 2 ? " selected" : "") + ">180°</option>";
   html += "<option value='3'" + String(display_rotation == 3 ? " selected" : "") + ">270°</option>";
   html += "</select>";
-  html += "<p class='warn'>⚠ Changing rotation will reboot the device to apply.</p>";
-  html += "<button type='submit' class='btn btn-orange' onclick='return confirm(\"Changing display rotation will reboot the device. Continue?\");'>Save & Reboot</button>";
+  html += "<label>Brightness: <span id='brightness-value'>" + String(display_brightness) + "</span>%</label>";
+  html += "<input type='range' name='disp_bri' min='5' max='100' step='5' value='" + String(display_brightness) + "' oninput=\"document.getElementById('brightness-value').textContent=this.value\">";
+  html += "<p class='warn'>Changing rotation will reboot the device. Brightness is applied when saved.</p>";
+  html += "<button type='submit' class='btn btn-orange'>Save Display Settings</button>";
   html += "</form>";
   html += "</div>";
   
@@ -3796,6 +3807,7 @@ void handleLocalExportConfig() {
   
   // Display settings
   doc["disp_rot"] = display_rotation;
+  doc["disp_bri"] = display_brightness;
   
   // MQTT settings
   doc["mqtt_en"] = mqtt_enabled;
@@ -4138,6 +4150,12 @@ void handleLocalImportConfig() {
       display_rotation = doc["disp_rot"].as<int>();
       if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
       preferences.putInt("disp_rot", display_rotation);
+    }
+    if (doc.containsKey("disp_bri")) {
+      display_brightness = doc["disp_bri"].as<int>();
+      display_brightness = constrain(display_brightness, 5, 100);
+      preferences.putInt("disp_bri", display_brightness);
+      applyDisplayBrightness();
     }
     
     // Import MQTT settings
@@ -5925,27 +5943,39 @@ void handleLocalMqttSave() {
 
 void handleLocalDisplaySave() {
   if (!checkAuth()) return;
+
+  int previous_rotation = display_rotation;
   
   if (localServer.hasArg("disp_rot")) {
     display_rotation = localServer.arg("disp_rot").toInt();
     if (display_rotation < 0 || display_rotation > 3) display_rotation = 0;
   }
+  if (localServer.hasArg("disp_bri")) {
+    display_brightness = localServer.arg("disp_bri").toInt();
+    display_brightness = constrain(display_brightness, 5, 100);
+  }
+  bool rotation_changed = display_rotation != previous_rotation;
   
   Preferences preferences;
   preferences.begin("cgm-config", false);
   preferences.putInt("disp_rot", display_rotation);
+  preferences.putInt("disp_bri", display_brightness);
   preferences.end();
+
+  applyDisplayBrightness();
   
-  Serial.printf("Display rotation saved: %d. Rebooting...\n", display_rotation);
+  Serial.printf("Display settings saved. Rotation: %d, brightness: %d%%\n", display_rotation, display_brightness);
   
-  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='5;url=/hardware'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
+  String html = "<html><head><meta charset='utf-8'><meta http-equiv='refresh' content='3;url=/hardware'><style>body{background:#181a1b;color:#fff;font-family:sans-serif;text-align:center;padding-top:50px;}h2{color:#5cb85c;}</style></head><body>";
   html += "<h2>Display Settings Saved!</h2>";
-  html += "<p>The device will reboot to apply the new rotation...</p>";
+  html += rotation_changed ? "<p>The device will reboot to apply the new rotation...</p>" : "<p>The new brightness has been applied.</p>";
   html += "</body></html>";
   
   localServer.send(200, "text/html; charset=utf-8", html);
-  delay(1000);
-  ESP.restart();
+  if (rotation_changed) {
+    delay(1000);
+    ESP.restart();
+  }
 }
 
 void handleLocalWifiGet() {
@@ -6108,4 +6138,3 @@ void showDiagnosticsScreen() {
   
   drawDashboard();
 }
-
