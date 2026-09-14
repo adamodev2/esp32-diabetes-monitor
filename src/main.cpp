@@ -16,7 +16,7 @@ LGFX gfx;
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.46"
+#define BUILD_VERSION "1.0.47"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -2044,8 +2044,20 @@ void drawHistoryGraph(bool clear_region) {
     if (barH > 0) {
       int barW = 1;
       if (i + 1 < history_count) {
-        long gap_minutes = (long)difftime(glucose_history_time[i + 1], glucose_history_time[i]) / 60;
-        if (gap_minutes > 1 && gap_minutes <= 5) barW = gap_minutes;
+        // Fill short internal gaps with the last known value. Calculate the
+        // width from the rendered X positions so rounding cannot leave a
+        // one-pixel hole.
+        long next_age_seconds = (long)difftime(graph_end, glucose_history_time[i + 1]);
+        int next_px = endX - 1 - (next_age_seconds / 60);
+        long gap_seconds = (long)difftime(glucose_history_time[i + 1], glucose_history_time[i]);
+        if (gap_seconds > 60 && gap_seconds <= 15 * 60L) {
+          barW = max(1, next_px - px);
+        }
+      } else if (age_seconds <= 15 * 60L) {
+        // Also carry the newest value to "now" for a short live-data delay.
+        // Previously only gaps enclosed by two readings were filled, so even
+        // a one-minute delay produced a black trailing gap.
+        barW = endX - px;
       }
       if (px + barW > endX) barW = endX - px;
       gfx.fillRect(px, py, max(1, barW), barH, pt_color);
