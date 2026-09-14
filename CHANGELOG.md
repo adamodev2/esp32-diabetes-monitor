@@ -2,6 +2,19 @@
 
 All notable changes to the ESP32 CGM Display project.
 
+## [1.0.47]
+
+### Fixed
+- **Short graph gaps**: Missing readings up to 15 minutes are drawn using the last known value.
+- **Trailing graph gap**: A brief delay after the newest reading no longer creates an immediate black gap at the right edge of the chart.
+
+## [1.0.46]
+
+### Changed
+- **Reduced display flicker**: Periodic Libre updates no longer clear and redraw the entire screen.
+- **Region-based refresh**: The glucose banner, moving history graph, and status bar refresh independently only when needed.
+- **Quieter updates**: Removed the transient `Syncing...`, `Refreshing...`, and graph-level failure messages.
+
 ## [1.0.45]
 
 ### Changed

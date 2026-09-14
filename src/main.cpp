@@ -16,7 +16,7 @@ LGFX gfx;
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.45"
+#define BUILD_VERSION "1.0.47"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -416,11 +416,11 @@ WebServer localServer(80);
 
 // Forward declarations
 void drawSplashScreen();
-void drawDashboard();
-void drawHistoryGraph();
+void drawDashboard(bool full_redraw = true);
+void drawHistoryGraph(bool clear_region = false);
 void drawTrendArrow(int x, int y, int trend, uint32_t color);
 void drawThickLine(int x1, int y1, int x2, int y2, int thickness, uint32_t color);
-void drawTopStatusBar();
+void drawTopStatusBar(bool force = false);
 bool libreLinkUpLogin();
 bool libreLinkUpFetchData();
 int mapGlucoseToY(float val);
@@ -1458,20 +1458,11 @@ void loop() {
     last_poll = millis();
     Serial.println("Timer triggered. Polling LibreLinkUp API...");
     
-    // Draw visual indicator during fetch
-    gfx.setFont(&fonts::DejaVu18);
-    gfx.setTextColor(0x33B5E5);
-    gfx.drawCenterString("Syncing...", 240, 310);
-    
     bool success = libreLinkUpFetchData();
-    drawDashboard(); // Redraw dashboard to update values/graphics
+    drawDashboard(false); // Redraw only dashboard regions that can change
     
     if (success) {
       mqttPublish();  // Publish updated data to MQTT
-    } else {
-      gfx.setFont(&fonts::DejaVu18);
-      gfx.setTextColor(0xD9534F);
-      gfx.drawCenterString("Update Failed!", 240, 310);
     }
   }
   
@@ -1514,19 +1505,11 @@ void loop() {
           last_touch = millis();
           Serial.println("Screen touched. Forcing immediate update...");
           
-          gfx.setFont(&fonts::DejaVu18);
-          gfx.setTextColor(0x33B5E5);
-          gfx.drawCenterString("Refreshing...", 240, 310);
-          
           bool success = libreLinkUpFetchData();
-          drawDashboard();
+          drawDashboard(false);
           
           if (success) {
             mqttPublish();  // Publish updated data to MQTT
-          } else {
-            gfx.setFont(&fonts::DejaVu18);
-            gfx.setTextColor(0xD9534F);
-            gfx.drawCenterString("Refresh Failed!", 240, 310);
           }
           
           last_poll = millis(); // Reset regular timer
@@ -1708,7 +1691,7 @@ void loop() {
       mqtt_force_refresh = false;
       Serial.println("[MQTT] Force refresh command received. Polling LLU...");
       libreLinkUpFetchData();
-      drawDashboard();
+      drawDashboard(false);
       mqttPublish();
     }
   }
@@ -1733,13 +1716,19 @@ void drawSplashScreen() {
   gfx.drawCenterString("Build: " BUILD_VERSION, 240, 310);
 }
 
-void drawDashboard() {
-  // Clear the screen with deep black
-  gfx.fillScreen(0x000000); 
-  
+void drawDashboard(bool full_redraw) {
+  if (full_redraw) {
+    gfx.fillScreen(0x000000);
+  }
+
   // Set alert color coding based on thresholds and stale status
-  uint32_t status_color = 0x888888; // Default Grey
   bool is_stale = isCurrentReadingStale();
+  static String rendered_timestamp = "";
+  static bool rendered_stale = true;
+  bool redraw_banner = full_redraw || last_timestamp != rendered_timestamp || is_stale != rendered_stale;
+
+  if (redraw_banner) {
+  uint32_t status_color = 0x888888; // Default Grey
   
   String banner_msg = "";
   if (is_stale) {
@@ -1925,12 +1914,15 @@ void drawDashboard() {
     gfx.setTextColor(0x000000);
     gfx.drawCenterString(banner_msg.c_str(), 240, banner_top + 105);
   }
+  rendered_timestamp = last_timestamp;
+  rendered_stale = is_stale;
+  }
   
-  // 4. Render the expanded history graph (on black background)
-  drawHistoryGraph();
+  // The graph has a moving time axis, so only its own region is refreshed.
+  drawHistoryGraph(!full_redraw);
   
-  // 5. Draw the top status bar (black-text-on-white)
-  drawTopStatusBar();
+  // Redraw the status bar independently from the main dashboard.
+  drawTopStatusBar(full_redraw);
 }
 
 void drawThickLine(int x1, int y1, int x2, int y2, int thickness, uint32_t color) {
@@ -1998,12 +1990,16 @@ int mapGlucoseToY(float val) {
   return 465 - (int)((val - graph_min) * (265.0 / range));
 }
 
-void drawHistoryGraph() {
+void drawHistoryGraph(bool clear_region) {
   int startX = 15;
   int endX = 465;
   int graphW = endX - startX;
   int startY = 200;
   int endY = 465;
+
+  if (clear_region) {
+    gfx.fillRect(0, 180, 480, 300, 0x000000);
+  }
   
   // Draw base axis line
   gfx.drawLine(startX, endY, endX, endY, 0x444444);
@@ -2048,8 +2044,20 @@ void drawHistoryGraph() {
     if (barH > 0) {
       int barW = 1;
       if (i + 1 < history_count) {
-        long gap_minutes = (long)difftime(glucose_history_time[i + 1], glucose_history_time[i]) / 60;
-        if (gap_minutes > 1 && gap_minutes <= 5) barW = gap_minutes;
+        // Fill short internal gaps with the last known value. Calculate the
+        // width from the rendered X positions so rounding cannot leave a
+        // one-pixel hole.
+        long next_age_seconds = (long)difftime(graph_end, glucose_history_time[i + 1]);
+        int next_px = endX - 1 - (next_age_seconds / 60);
+        long gap_seconds = (long)difftime(glucose_history_time[i + 1], glucose_history_time[i]);
+        if (gap_seconds > 60 && gap_seconds <= 15 * 60L) {
+          barW = max(1, next_px - px);
+        }
+      } else if (age_seconds <= 15 * 60L) {
+        // Also carry the newest value to "now" for a short live-data delay.
+        // Previously only gaps enclosed by two readings were filled, so even
+        // a one-minute delay produced a black trailing gap.
+        barW = endX - px;
       }
       if (px + barW > endX) barW = endX - px;
       gfx.fillRect(px, py, max(1, barW), barH, pt_color);
@@ -2081,7 +2089,29 @@ void drawHistoryGraph() {
   gfx.drawString(high_label, startX + 8, y_high - 7);
 }
 
-void drawTopStatusBar() {
+void drawTopStatusBar(bool force) {
+  static long rendered_minute = -1;
+  static int rendered_wifi_status = -1;
+  static bool rendered_stale = true;
+  static time_t rendered_dm_last = -1;
+  static time_t rendered_dm_next = -1;
+  static bool rendered_2fa_pending = false;
+
+  long current_minute = isTimeSynced() ? (long)(time(nullptr) / 60) : (long)(millis() / 60000UL);
+  int wifi_status = (int)WiFi.status();
+  bool stale = isCurrentReadingStale();
+  if (!force && current_minute == rendered_minute && wifi_status == rendered_wifi_status &&
+      stale == rendered_stale && dm_last_sent_epoch == rendered_dm_last &&
+      dm_next_send_epoch == rendered_dm_next && dm_2fa_pending == rendered_2fa_pending) {
+    return;
+  }
+  rendered_minute = current_minute;
+  rendered_wifi_status = wifi_status;
+  rendered_stale = stale;
+  rendered_dm_last = dm_last_sent_epoch;
+  rendered_dm_next = dm_next_send_epoch;
+  rendered_2fa_pending = dm_2fa_pending;
+
   int bar_height = (dm_enable_connection && dm_auto_send) ? (dm_2fa_pending ? 72 : 56) : 40;
   gfx.fillRect(0, 0, 480, bar_height, 0xFFFFFF); // White background
   
