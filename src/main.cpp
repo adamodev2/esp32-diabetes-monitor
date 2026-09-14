@@ -16,7 +16,7 @@ LGFX gfx;
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.44"
+#define BUILD_VERSION "1.0.45"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -2088,18 +2088,22 @@ void drawTopStatusBar() {
   // Line 1: LibreLinkUp status & WiFi
   gfx.setFont(&fonts::DejaVu18);
   String msg = "";
+  String current_time = isTimeSynced() ? formatLocalTime(time(nullptr), "%H:%M") : "--:--";
   if (last_fetch_time == 0) {
     gfx.setTextColor(0x000000); // Black text
-    msg = "Awaiting Data (" + String(llu_units) + ")";
+    msg = current_time + ", Awaiting data";
   } else {
     bool stale = isCurrentReadingStale();
+    long age_minutes = last_reading_epoch > 0 && isTimeSynced()
+      ? max(0L, (long)difftime(time(nullptr), last_reading_epoch) / 60L)
+      : (long)(millis() - last_fetch_time) / 60000L;
     if (stale) {
       gfx.setTextColor(0xCC0000); // Dark red warning for stale readings
+      msg = current_time + ", No data for " + String(age_minutes) + "m";
     } else {
       gfx.setTextColor(0x000000); // Black text
+      msg = current_time + ", Updated " + String(age_minutes) + "m ago";
     }
-    String timeStr = formatTimestamp(last_timestamp);
-    msg = stale ? "No data since " + timeStr : "Updated " + timeStr + " (" + String(llu_units) + ")";
   }
   gfx.drawString(msg, 15, (dm_enable_connection && dm_auto_send) ? 6 : 10);
   
