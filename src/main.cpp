@@ -16,7 +16,7 @@ LGFX gfx;
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.43"
+#define BUILD_VERSION "1.0.44"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -397,12 +397,14 @@ float last_glucose = 0.0;
 int last_trend = 3; // 3 = flat/stable
 String last_timestamp = "";
 unsigned long last_fetch_time = 0;
+time_t last_reading_epoch = 0;
 time_t llu_last_fetch_attempt_epoch = 0;
 time_t llu_last_fetch_success_epoch = 0;
 String llu_last_fetch_status = "Never Synced";
 
 // History buffer for the chart
 float glucose_history[GRAPH_HISTORY_SIZE];
+time_t glucose_history_time[GRAPH_HISTORY_SIZE];
 int history_count = 0;
 
 // WiFiManager configuration portal parameters
@@ -423,6 +425,10 @@ bool libreLinkUpLogin();
 bool libreLinkUpFetchData();
 int mapGlucoseToY(float val);
 void drawPendingConfigScreen();
+time_t parseLibreTimestamp(const String &timestamp, bool utc);
+bool pushToHistory(float val, time_t timestamp, bool persist = true);
+void saveHistory();
+bool isCurrentReadingStale();
 
 // Local WebServer handlers
 void handleLocalRoot();
@@ -603,6 +609,12 @@ void loadPreferences() {
     size_t expected_len = history_count * sizeof(float);
     if (read_len < expected_len) {
       history_count = read_len / sizeof(float);
+    }
+    size_t time_len = preferences.getBytes("hist_time", glucose_history_time, sizeof(glucose_history_time));
+    if (time_len < history_count * sizeof(time_t)) {
+      // Old firmware stored values without timestamps. They cannot be placed
+      // truthfully on a time-based chart, so discard them during migration.
+      history_count = 0;
     }
   }
   
@@ -848,16 +860,11 @@ uint32_t getColorCode(const char* color_str) {
 bool checkDropTrigger(float val1, float val2, int duration_min) {
   if (last_glucose > val2) return false; // Current value must be <= val2
   
-  int entries_to_check = duration_min / llu_poll_interval;
-  if (entries_to_check < 1) entries_to_check = 1;
-  if (entries_to_check >= history_count) entries_to_check = history_count - 1;
-  
-  for (int i = 1; i <= entries_to_check; i++) {
-    int idx = history_count - 1 - i;
-    if (idx >= 0) {
-      if (glucose_history[idx] >= val1) {
-        return true;
-      }
+  time_t cutoff = last_reading_epoch - duration_min * 60;
+  for (int idx = history_count - 2; idx >= 0; idx--) {
+    if (glucose_history_time[idx] < cutoff) break;
+    if (glucose_history[idx] >= val1) {
+      return true;
     }
   }
   return false;
@@ -866,16 +873,11 @@ bool checkDropTrigger(float val1, float val2, int duration_min) {
 bool checkRiseTrigger(float val1, float val2, int duration_min) {
   if (last_glucose < val2) return false; // Current value must be >= val2
   
-  int entries_to_check = duration_min / llu_poll_interval;
-  if (entries_to_check < 1) entries_to_check = 1;
-  if (entries_to_check >= history_count) entries_to_check = history_count - 1;
-  
-  for (int i = 1; i <= entries_to_check; i++) {
-    int idx = history_count - 1 - i;
-    if (idx >= 0) {
-      if (glucose_history[idx] <= val1) {
-        return true;
-      }
+  time_t cutoff = last_reading_epoch - duration_min * 60;
+  for (int idx = history_count - 2; idx >= 0; idx--) {
+    if (glucose_history_time[idx] < cutoff) break;
+    if (glucose_history[idx] <= val1) {
+      return true;
     }
   }
   return false;
@@ -946,23 +948,92 @@ String getDeltaRawStr(float val_curr, float val_prev) {
   return val_str;
 }
 
-void pushToHistory(float val) {
-  if (history_count < GRAPH_HISTORY_SIZE) {
-    glucose_history[history_count] = val;
-    history_count++;
-  } else {
-    // Shift left
-    for (int i = 0; i < GRAPH_HISTORY_SIZE - 1; i++) {
-      glucose_history[i] = glucose_history[i + 1];
-    }
-    glucose_history[GRAPH_HISTORY_SIZE - 1] = val;
+bool isCurrentReadingStale() {
+  if (last_glucose <= 0.0 || last_timestamp.length() == 0) return true;
+  if (last_reading_epoch > 0 && isTimeSynced()) {
+    return difftime(time(nullptr), last_reading_epoch) >= 15 * 60;
   }
-  
+  return last_fetch_time == 0 || (millis() - last_fetch_time) >= 15 * 60000UL;
+}
+
+time_t parseLibreTimestamp(const String &timestamp, bool utc) {
+  if (timestamp.length() < 10) return 0;
+
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  char ampm[3] = "";
+  int parsed = sscanf(timestamp.c_str(), "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second);
+  if (parsed < 5) {
+    parsed = sscanf(timestamp.c_str(), "%d/%d/%d %d:%d:%d %2s", &month, &day, &year, &hour, &minute, &second, ampm);
+    if (parsed >= 6) {
+      if ((ampm[0] == 'P' || ampm[0] == 'p') && hour < 12) hour += 12;
+      if ((ampm[0] == 'A' || ampm[0] == 'a') && hour == 12) hour = 0;
+    }
+  }
+  if (parsed < 5 || year < 2020 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+
+  struct tm tm_info = {};
+  tm_info.tm_year = year - 1900;
+  tm_info.tm_mon = month - 1;
+  tm_info.tm_mday = day;
+  tm_info.tm_hour = hour;
+  tm_info.tm_min = minute;
+  tm_info.tm_sec = second;
+  tm_info.tm_isdst = -1;
+  if (!utc) return mktime(&tm_info);
+
+  // ESP32 newlib does not expose timegm(), so convert the UTC civil date
+  // directly to days since 1970-01-01.
+  int y = year - (month <= 2);
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned shifted_month = (unsigned)(month + (month > 2 ? -3 : 9));
+  unsigned doy = (153 * shifted_month + 2) / 5 + (unsigned)day - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days_since_epoch = era * 146097L + (long)doe - 719468L;
+  return (time_t)(days_since_epoch * 86400L + hour * 3600L + minute * 60L + second);
+}
+
+void saveHistory() {
   Preferences preferences;
   preferences.begin("cgm-config", false);
-  preferences.putBytes("history", glucose_history, sizeof(glucose_history));
+  preferences.putBytes("history", glucose_history, history_count * sizeof(float));
+  preferences.putBytes("hist_time", glucose_history_time, history_count * sizeof(time_t));
   preferences.putInt("hist_count", history_count);
   preferences.end();
+}
+
+bool pushToHistory(float val, time_t timestamp, bool persist) {
+  if (val <= 0.0 || timestamp <= 0) return false;
+
+  int insert_at = history_count;
+  for (int i = history_count - 1; i >= 0; i--) {
+    if (glucose_history_time[i] == timestamp) return false;
+    if (glucose_history_time[i] < timestamp) {
+      insert_at = i + 1;
+      break;
+    }
+    insert_at = i;
+  }
+
+  if (history_count == GRAPH_HISTORY_SIZE) {
+    if (insert_at == 0) return false; // Older than the visible retained history.
+    for (int i = 1; i < history_count; i++) {
+      glucose_history[i - 1] = glucose_history[i];
+      glucose_history_time[i - 1] = glucose_history_time[i];
+    }
+    history_count--;
+    insert_at--;
+  }
+  for (int i = history_count; i > insert_at; i--) {
+    glucose_history[i] = glucose_history[i - 1];
+    glucose_history_time[i] = glucose_history_time[i - 1];
+  }
+  glucose_history[insert_at] = val;
+  glucose_history_time[insert_at] = timestamp;
+  history_count++;
+
+  if (persist) saveHistory();
+  return true;
 }
 
 void runLibreLinkUpTest(String &logOut) {
@@ -1496,9 +1567,9 @@ void loop() {
         bool can_send = true;
         String fail_reason = "";
         
-        if (last_fetch_time == 0 || last_timestamp.length() == 0) {
+        if (last_fetch_time == 0 || last_timestamp.length() == 0 || isCurrentReadingStale()) {
           can_send = false;
-          fail_reason = "No Libre reading";
+          fail_reason = "No fresh Libre reading";
         } else if (strcmp(dm_last_uploaded_libre_ts, last_timestamp.c_str()) == 0) {
           can_send = false;
           fail_reason = "Duplicate reading";
@@ -1668,8 +1739,7 @@ void drawDashboard() {
   
   // Set alert color coding based on thresholds and stale status
   uint32_t status_color = 0x888888; // Default Grey
-  unsigned long elapsed_m = (millis() - last_fetch_time) / 60000;
-  bool is_stale = (elapsed_m >= 15) || (last_fetch_time == 0);
+  bool is_stale = isCurrentReadingStale();
   
   String banner_msg = "";
   if (is_stale) {
@@ -1956,11 +2026,14 @@ void drawHistoryGraph() {
     return;
   }
   
-  // Plot historical bars (no pixel gap)
-  int barW = graphW / GRAPH_HISTORY_SIZE; // 450 / 90 = 5 pixels
-  
+  // The X axis is real time: one pixel per minute over the last 7.5 hours.
+  // Missing samples therefore remain visibly empty instead of being joined.
+  time_t graph_end = isTimeSynced() ? time(nullptr) : glucose_history_time[history_count - 1];
+  bool drew_point = false;
   for (int i = 0; i < history_count; i++) {
-    int px = startX + i * barW;
+    long age_seconds = (long)difftime(graph_end, glucose_history_time[i]);
+    if (age_seconds < 0 || age_seconds > GRAPH_HISTORY_SIZE * 60L) continue;
+    int px = endX - 1 - (age_seconds / 60);
     int py = mapGlucoseToY(glucose_history[i]);
     
     // Choose color code for each specific point
@@ -1973,8 +2046,21 @@ void drawHistoryGraph() {
     
     int barH = endY - py;
     if (barH > 0) {
-      gfx.fillRect(px, py, barW, barH, pt_color);
+      int barW = 1;
+      if (i + 1 < history_count) {
+        long gap_minutes = (long)difftime(glucose_history_time[i + 1], glucose_history_time[i]) / 60;
+        if (gap_minutes > 1 && gap_minutes <= 5) barW = gap_minutes;
+      }
+      if (px + barW > endX) barW = endX - px;
+      gfx.fillRect(px, py, max(1, barW), barH, pt_color);
+      drew_point = true;
     }
+  }
+
+  if (!drew_point) {
+    gfx.setFont(&fonts::DejaVu18);
+    gfx.setTextColor(0x666666);
+    gfx.drawCenterString("No recent history data", 240, startY + 100);
   }
 
   // Draw dotted indicator low line on top of bars
@@ -2006,14 +2092,14 @@ void drawTopStatusBar() {
     gfx.setTextColor(0x000000); // Black text
     msg = "Awaiting Data (" + String(llu_units) + ")";
   } else {
-    unsigned long elapsed_m = (millis() - last_fetch_time) / 60000;
-    if (elapsed_m >= 15) {
+    bool stale = isCurrentReadingStale();
+    if (stale) {
       gfx.setTextColor(0xCC0000); // Dark red warning for stale readings
     } else {
       gfx.setTextColor(0x000000); // Black text
     }
     String timeStr = formatTimestamp(last_timestamp);
-    msg = "Updated " + timeStr + " (" + String(llu_units) + ")";
+    msg = stale ? "No data since " + timeStr : "Updated " + timeStr + " (" + String(llu_units) + ")";
   }
   gfx.drawString(msg, 15, (dm_enable_connection && dm_auto_send) ? 6 : 10);
   
@@ -2159,7 +2245,6 @@ bool libreLinkUpLogin() {
 }
 
 bool libreLinkUpFetchData() {
-  last_glucose = 0.0; // Reset to 0 on new fetch attempt (internet loss check)
   llu_last_fetch_attempt_epoch = time(nullptr);
   llu_last_fetch_status = "Fetching...";
 
@@ -2270,19 +2355,48 @@ bool libreLinkUpFetchData() {
   }
   int trend = measurement["TrendArrow"].as<int>();
   String timestamp = measurement["Timestamp"].as<String>();
+  String factory_timestamp = measurement["FactoryTimestamp"].as<String>();
+  time_t reading_epoch = parseLibreTimestamp(factory_timestamp, true);
+  if (reading_epoch == 0) reading_epoch = parseLibreTimestamp(timestamp, false);
+  if (reading_epoch == 0 && timestamp != last_timestamp) reading_epoch = time(nullptr);
+
+  if (value <= 0.0 || timestamp.length() == 0 || reading_epoch <= 0) {
+    Serial.println("LLU returned an invalid or incomplete glucose measurement.");
+    llu_last_fetch_status = "Invalid Measurement";
+    return false;
+  }
+
+  // Backfill the time-based chart from history supplied by LibreLinkUp.
+  bool history_changed = false;
+  if (connection.containsKey("graphData")) {
+    JsonArray graph_data = connection["graphData"].as<JsonArray>();
+    for (JsonObject item : graph_data) {
+      float history_value = item.containsKey("ValueInMgPerDl") ? item["ValueInMgPerDl"].as<float>() : item["Value"].as<float>();
+      if (history_value < 30.0 && history_value > 0.0) history_value *= 18.0182;
+      String history_factory_ts = item["FactoryTimestamp"].as<String>();
+      String history_ts = item["Timestamp"].as<String>();
+      time_t history_epoch = parseLibreTimestamp(history_factory_ts, true);
+      if (history_epoch == 0) history_epoch = parseLibreTimestamp(history_ts, false);
+      if (pushToHistory(history_value, history_epoch, false)) history_changed = true;
+    }
+  }
+
+  bool is_new_reading = timestamp != last_timestamp || reading_epoch != last_reading_epoch;
   
   // Store global values
   last_glucose = value;
   last_trend = trend;
   last_timestamp = timestamp;
-  last_fetch_time = millis();
+  last_reading_epoch = reading_epoch;
+  if (is_new_reading) last_fetch_time = millis();
   llu_last_fetch_success_epoch = time(nullptr);
-  llu_last_fetch_status = "Success";
+  llu_last_fetch_status = is_new_reading ? "Success" : "No New Data";
   
-  // Push reading to historical buffer
-  pushToHistory(value);
+  if (pushToHistory(value, reading_epoch, false)) history_changed = true;
+  if (history_changed) saveHistory();
   
-  Serial.printf("Parsed Glucose: %.1f mg/dL, Trend: %d, Time: %s\n", value, trend, timestamp.c_str());
+  Serial.printf("Parsed Glucose: %.1f mg/dL, Trend: %d, Time: %s, new: %s\n",
+                value, trend, timestamp.c_str(), is_new_reading ? "yes" : "no");
   return true;
 }
 
@@ -2311,17 +2425,19 @@ void handleLocalRoot() {
   String llu_status_text = "";
   if (strlen(llu_email) == 0 || strlen(llu_password) == 0) {
     llu_status_text = "Awaiting configuration";
-  } else if (llu_last_fetch_status != "Success" && llu_last_fetch_status != "Never Synced" && llu_last_fetch_status != "Fetching...") {
+  } else if (llu_last_fetch_status != "Success" && llu_last_fetch_status != "No New Data" && llu_last_fetch_status != "Never Synced" && llu_last_fetch_status != "Fetching...") {
     llu_status_text = "Error (" + llu_last_fetch_status + ")";
   } else if (last_fetch_time > 0) {
-    unsigned long elapsed_m = (millis() - last_fetch_time) / 60000;
+    long elapsed_m = last_reading_epoch > 0 && isTimeSynced()
+      ? max(0L, (long)difftime(time(nullptr), last_reading_epoch) / 60L)
+      : (long)(millis() - last_fetch_time) / 60000L;
     String glucoseStr = "";
     if (strcmp(llu_units, "mmol/L") == 0) {
       glucoseStr = String(last_glucose / 18.0182, 1) + " mmol/L";
     } else {
       glucoseStr = String((int)last_glucose) + " mg/dL";
     }
-    llu_status_text = "Last Sync " + String(elapsed_m) + "m ago, " + glucoseStr;
+    llu_status_text = (isCurrentReadingStale() ? "No fresh data for " : "Last reading ") + String(elapsed_m) + "m, " + glucoseStr;
   } else {
     llu_status_text = llu_last_fetch_status;
   }

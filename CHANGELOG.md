@@ -2,6 +2,14 @@
 
 All notable changes to the ESP32 CGM Display project.
 
+## [1.0.44]
+
+### Fixed
+- **Truthful time-based graph**: History points are positioned by their Libre timestamps, so network and uploader outages remain visible as empty gaps.
+- **History recovery**: Available LibreLinkUp `graphData` is merged into the chart after reconnection without duplicating readings.
+- **Stale data handling**: Repeated old Libre measurements no longer refresh the reading age or add fake graph continuity.
+- **No zero on fetch failure**: The last valid measurement is retained internally; after 15 minutes the dashboard shows no current value and reports when data stopped.
+
 ## [1.0.43]
 
 ### Added
