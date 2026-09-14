@@ -2,6 +2,12 @@
 
 All notable changes to the ESP32 CGM Display project.
 
+## [1.0.45]
+
+### Changed
+- **Reading age in status bar**: The top line now shows the current local time and relative reading age, for example `13:45, Updated 3m ago`.
+- **Clear stale status**: When data is stale, the same line shows how long fresh data has been unavailable. The glucose unit was removed from this status line.
+
 ## [1.0.44]
 
 ### Fixed
