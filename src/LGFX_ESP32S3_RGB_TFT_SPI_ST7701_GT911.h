@@ -81,12 +81,12 @@ public:
     }
     _panel_instance.setBus(&_bus_instance);
 
-    // {
-    //   auto cfg = _light_instance.config();
-    //   cfg.pin_bl = GPIO_NUM_38;
-    //   _light_instance.config(cfg);
-    // }
-    // _panel_instance.light(&_light_instance);
+    {
+      auto cfg = _light_instance.config();
+      cfg.pin_bl = GPIO_NUM_38;
+      _light_instance.config(cfg);
+    }
+    _panel_instance.light(&_light_instance);
 
     {
       auto cfg = _touch_instance.config();

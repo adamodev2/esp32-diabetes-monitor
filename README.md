@@ -21,6 +21,16 @@ This project allows you to use a simple ESP32-S3 powered display to act as a Lib
 
 ---
 
+## Changes in this fork (v1.0.43)
+
+*   Added a **1-100% display brightness slider** with 1% increments to the Hardware Control web page.
+*   Brightness is applied immediately, saved in NVS, restored after reboot, and included in configuration backup/restore.
+*   Enabled hardware PWM backlight control on GPIO 38 while keeping display rotation support.
+*   Added a **GitHub Actions** workflow that builds the ESP32 firmware and provides `bootloader.bin`, `partitions.bin`, and `firmware.bin` as downloadable artifacts.
+*   Updated the three binaries in `firmware-release` from the verified v1.0.43 build. Existing LibreLinkUp settings remain compatible.
+
+---
+
 ## 🌟 Key Features
 
 *   **LibreLinkUp Follower Sync**: Periodically polls the LibreLinkUp follower API to display the latest glucose readings, trend arrows, and sync status. Includes delta readings
@@ -32,6 +42,7 @@ This project allows you to use a simple ESP32-S3 powered display to act as a Lib
 *   **Custom Trigger Messages**: Set trigger conditions to display messages and change graph colours
 *   **Web Administration Portal**: A secure, mobile-friendly web administration panel accessed directly over Wi-Fi, featuring:
     *   Separate menus for follower accounts, alerts/tolerances, and hardware commands.
+    *   Display brightness and rotation controls.
     *   Password management (enforcing a secure custom password).
     *   Diagnostics page with network metrics, uptime, and communication logs.
     *   Configuration backup and restore (JSON import/export).
@@ -82,6 +93,10 @@ Here is a visual walk-through of the portal pages:
 *   `firmware-release`: Binaries/firmware for flashing to ESP32.
 
 All other folders are only required if you want to build from source or modify to suit your needs
+
+### Automated cloud builds
+
+GitHub Actions builds the firmware after every push and pull request. Open the repository's **Actions** tab, select the latest successful **Build ESP32 firmware** run, and download the `esp32-diabetes-monitor-firmware` artifact. For an OTA update, upload its `firmware.bin` file through **Hardware Control → Update Firmware (OTA)**.
 
 *   `src/main.cpp`: Main firmware source file containing WiFi logic, API integrations, web portal routes, NVS configuration, HMI drawing loops, and page templates.
 *   `src/LGFX_ESP32S3_RGB_TFT_SPI_ST7701_GT911.h`: LovyanGFX graphics initialization driver for the target RGB TFT LCD screen and capacitive touch controller.
