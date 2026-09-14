@@ -36,6 +36,14 @@ jobs:
       - name: Install PlatformIO
         run: python -m pip install --upgrade platformio
 
+      - name: Read firmware version
+        id: firmware_version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^#define BUILD_VERSION "\([^"]*\)"/\1/p' src/main.cpp)
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Build firmware
         run: pio run
 
@@ -49,7 +57,7 @@ jobs:
       - name: Upload firmware
         uses: actions/upload-artifact@v7
         with:
-          name: esp32-diabetes-monitor-firmware
+          name: esp32-diabetes-monitor-firmware-v${{ steps.firmware_version.outputs.version }}
           path: dist/*.bin
           if-no-files-found: error
           retention-days: 30

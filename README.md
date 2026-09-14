@@ -21,8 +21,11 @@ This project allows you to use a simple ESP32-S3 powered display to act as a Lib
 
 ---
 
-## Changes in this fork (v1.0.43)
+## Changes in this fork (v1.0.44)
 
+*   The graph now uses real Libre measurement timestamps and leaves visible gaps when data was unavailable.
+*   After reconnection, history returned in LibreLinkUp `graphData` is merged into the chart without duplicate points.
+*   Stale or repeated measurements no longer appear as fresh data, and failed fetches no longer produce a glucose value of zero.
 *   Added a **1-100% display brightness slider** with 1% increments to the Hardware Control web page.
 *   Brightness is applied immediately, saved in NVS, restored after reboot, and included in configuration backup/restore.
 *   Enabled hardware PWM backlight control on GPIO 38 while keeping display rotation support.

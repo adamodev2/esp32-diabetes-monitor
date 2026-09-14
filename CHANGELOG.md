@@ -2,6 +2,20 @@
 
 All notable changes to the ESP32 CGM Display project.
 
+## [1.0.45]
+
+### Changed
+- **Reading age in status bar**: The top line now shows the current local time and relative reading age, for example `13:45, Updated 3m ago`.
+- **Clear stale status**: When data is stale, the same line shows how long fresh data has been unavailable. The glucose unit was removed from this status line.
+
+## [1.0.44]
+
+### Fixed
+- **Truthful time-based graph**: History points are positioned by their Libre timestamps, so network and uploader outages remain visible as empty gaps.
+- **History recovery**: Available LibreLinkUp `graphData` is merged into the chart after reconnection without duplicating readings.
+- **Stale data handling**: Repeated old Libre measurements no longer refresh the reading age or add fake graph continuity.
+- **No zero on fetch failure**: The last valid measurement is retained internally; after 15 minutes the dashboard shows no current value and reports when data stopped.
+
 ## [1.0.43]
 
 ### Added
