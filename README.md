@@ -31,6 +31,14 @@ This project allows you to use a simple ESP32-S3 powered display to act as a Lib
 
 ---
 
+## Firmware versions in CI
+
+The GitHub Actions build assigns the version to both the firmware (including its OTA signature) and the artifact name. The baseline is `1.0.43` at main commit `f565fea`. Each later first-parent commit on `main` advances the patch version. For example, the first commit after the baseline builds `1.0.44`.
+
+PRs and development branches build the next patch with `.dev` and the workflow run number, such as `1.0.44.dev27`. This keeps development binaries distinct from releases and gives each run a unique version. The version is injected in the CI build workspace; local PlatformIO builds use the baseline `BUILD_VERSION` in `src/main.cpp`.
+
+---
+
 ## 🌟 Key Features
 
 *   **LibreLinkUp Follower Sync**: Periodically polls the LibreLinkUp follower API to display the latest glucose readings, trend arrows, and sync status. Includes delta readings
