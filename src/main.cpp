@@ -16,7 +16,7 @@ LGFX gfx;
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.43"
+#define BUILD_VERSION "1.0.46"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -353,6 +353,44 @@ String formatLocalTime(time_t epoch, const char* format) {
   return String(buf);
 }
 
+time_t parseLibreTimestamp(const String &timestamp, bool utc) {
+  if (timestamp.length() < 10) return 0;
+
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  char ampm[3] = "";
+  int parsed = sscanf(timestamp.c_str(), "%d-%d-%dT%d:%d:%d",
+                      &year, &month, &day, &hour, &minute, &second);
+  if (parsed < 5) {
+    parsed = sscanf(timestamp.c_str(), "%d/%d/%d %d:%d:%d %2s",
+                    &month, &day, &year, &hour, &minute, &second, ampm);
+    if (parsed >= 6) {
+      if ((ampm[0] == 'P' || ampm[0] == 'p') && hour < 12) hour += 12;
+      if ((ampm[0] == 'A' || ampm[0] == 'a') && hour == 12) hour = 0;
+    }
+  }
+  if (parsed < 5 || year < 2020 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+
+  struct tm tm_info = {};
+  tm_info.tm_year = year - 1900;
+  tm_info.tm_mon = month - 1;
+  tm_info.tm_mday = day;
+  tm_info.tm_hour = hour;
+  tm_info.tm_min = minute;
+  tm_info.tm_sec = second;
+  tm_info.tm_isdst = -1;
+  if (!utc) return mktime(&tm_info);
+
+  // ESP32 newlib does not expose timegm(), so convert the UTC date directly.
+  int y = year - (month <= 2);
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned shifted_month = (unsigned)(month + (month > 2 ? -3 : 9));
+  unsigned doy = (153 * shifted_month + 2) / 5 + (unsigned)day - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days_since_epoch = era * 146097L + (long)doe - 719468L;
+  return (time_t)(days_since_epoch * 86400L + hour * 3600L + minute * 60L + second);
+}
+
 void recalculateNextSendTime() {
   if (!isTimeSynced()) {
     dm_next_send_epoch = 0;
@@ -433,6 +471,7 @@ float last_glucose = 0.0;
 int last_trend = 3; // 3 = flat/stable
 String last_timestamp = "";
 unsigned long last_fetch_time = 0;
+time_t last_reading_epoch = 0;
 time_t llu_last_fetch_attempt_epoch = 0;
 time_t llu_last_fetch_success_epoch = 0;
 String llu_last_fetch_status = "Never Synced";
@@ -459,6 +498,7 @@ bool libreLinkUpLogin();
 bool libreLinkUpFetchData();
 int mapGlucoseToY(float val);
 void drawPendingConfigScreen();
+time_t parseLibreTimestamp(const String &timestamp, bool utc);
 
 // Local WebServer handlers
 void handleLocalRoot();
@@ -2036,21 +2076,24 @@ void drawTopStatusBar() {
   int bar_height = (dm_enable_connection && dm_auto_send) ? (dm_2fa_pending ? 72 : 56) : 40;
   gfx.fillRect(0, 0, 480, bar_height, 0xFFFFFF); // White background
   
-  // Line 1: LibreLinkUp status & WiFi
+  // Line 1: current local time and age of the latest Libre reading
   gfx.setFont(&fonts::DejaVu18);
+  String current_time = isTimeSynced() ? formatLocalTime(time(nullptr), "%H:%M") : "--:--";
   String msg = "";
   if (last_fetch_time == 0) {
     gfx.setTextColor(0x000000); // Black text
-    msg = "Awaiting Data (" + String(llu_units) + ")";
+    msg = current_time + " (Awaiting data)";
   } else {
-    unsigned long elapsed_m = (millis() - last_fetch_time) / 60000;
-    if (elapsed_m >= 15) {
+    long age_minutes = last_reading_epoch > 0 && isTimeSynced()
+      ? (long)difftime(time(nullptr), last_reading_epoch) / 60L
+      : (long)(millis() - last_fetch_time) / 60000L;
+    if (age_minutes < 0) age_minutes = 0;
+    if (age_minutes >= 15) {
       gfx.setTextColor(0xCC0000); // Dark red warning for stale readings
     } else {
       gfx.setTextColor(0x000000); // Black text
     }
-    String timeStr = formatTimestamp(last_timestamp);
-    msg = "Updated " + timeStr + " (" + String(llu_units) + ")";
+    msg = current_time + " (Updated " + String(age_minutes) + "m ago)";
   }
   gfx.drawString(msg, 15, (dm_enable_connection && dm_auto_send) ? 6 : 10);
   
@@ -2307,11 +2350,16 @@ bool libreLinkUpFetchData() {
   }
   int trend = measurement["TrendArrow"].as<int>();
   String timestamp = measurement["Timestamp"].as<String>();
+  String factory_timestamp = measurement["FactoryTimestamp"].as<String>();
+  time_t reading_epoch = parseLibreTimestamp(factory_timestamp, true);
+  if (reading_epoch == 0) reading_epoch = parseLibreTimestamp(timestamp, false);
+  if (reading_epoch == 0) reading_epoch = time(nullptr);
   
   // Store global values
   last_glucose = value;
   last_trend = trend;
   last_timestamp = timestamp;
+  last_reading_epoch = reading_epoch;
   last_fetch_time = millis();
   llu_last_fetch_success_epoch = time(nullptr);
   llu_last_fetch_status = "Success";
