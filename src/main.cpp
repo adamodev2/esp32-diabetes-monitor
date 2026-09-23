@@ -56,8 +56,44 @@ int dm_api_interval = 30; // in minutes
 int dm_random_offset = 2; // in minutes
 char dm_start_sending[32] = ""; // "YYYY-MM-DDTHH:MM"
 char dm_stop_sending[32] = "";  // "YYYY-MM-DDTHH:MM"
-char dm_timezone_json[32] = "Europe/London";
-char dm_timezone_posix[64] = "GMT0BST,M3.5.0/1,M10.5.0/2";
+// The device clock and Diabetes:M scheduling use the same local time zone.
+char dm_timezone_json[32] = "Europe/Warsaw";
+char dm_timezone_posix[64] = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+
+struct TimeZoneOption { const char* name; const char* posix; };
+const TimeZoneOption timeZones[] = {
+  {"Europe/Warsaw", "CET-1CEST,M3.5.0/2,M10.5.0/3"},
+  {"Europe/Berlin", "CET-1CEST,M3.5.0/2,M10.5.0/3"},
+  {"Europe/London", "GMT0BST,M3.5.0/1,M10.5.0/2"},
+  {"UTC", "UTC0"},
+  {"America/New_York", "EST5EDT,M3.2.0/2,M11.1.0/2"},
+  {"America/Los_Angeles", "PST8PDT,M3.2.0/2,M11.1.0/2"}
+};
+
+const TimeZoneOption* findTimeZone(const String& name) {
+  for (const auto& zone : timeZones) {
+    if (name == zone.name) return &zone;
+  }
+  return nullptr;
+}
+
+void setDeviceTimeZone(const TimeZoneOption& zone) {
+  snprintf(dm_timezone_json, sizeof(dm_timezone_json), "%s", zone.name);
+  snprintf(dm_timezone_posix, sizeof(dm_timezone_posix), "%s", zone.posix);
+  setenv("TZ", dm_timezone_posix, 1);
+  tzset();
+}
+
+void appendTimeZoneSelect(String& html) {
+  html += "<label for='timezone'>Time zone (device clock and Diabetes:M)</label>";
+  html += "<select name='timezone' id='timezone'>";
+  for (const auto& zone : timeZones) {
+    html += "<option value='" + String(zone.name) + "'";
+    if (strcmp(dm_timezone_json, zone.name) == 0) html += " selected";
+    html += ">" + String(zone.name) + "</option>";
+  }
+  html += "</select>";
+}
 
 // Category Assignment configurations
 bool dm_auto_category = false;
@@ -630,8 +666,7 @@ void loadPreferences() {
   if (dm_heartbeat_interval < 1) dm_heartbeat_interval = 15;
   String dm_start_str = preferences.getString("dm_start", "");
   String dm_stop_str = preferences.getString("dm_stop", "");
-  String dm_tz_json_str = preferences.getString("dm_tz_json", "Europe/London");
-  String dm_tz_posix_str = preferences.getString("dm_tz_posix", "GMT0BST,M3.5.0/1,M10.5.0/2");
+  String dm_tz_json_str = preferences.getString("dm_tz_json", "Europe/Warsaw");
   
   // Load cached auth
   String dm_token_str = preferences.getString("dm_token", "");
@@ -702,8 +737,10 @@ void loadPreferences() {
   dm_note_str.toCharArray(dm_note_text, sizeof(dm_note_text));
   dm_start_str.toCharArray(dm_start_sending, sizeof(dm_start_sending));
   dm_stop_str.toCharArray(dm_stop_sending, sizeof(dm_stop_sending));
-  dm_tz_json_str.toCharArray(dm_timezone_json, sizeof(dm_timezone_json));
-  dm_tz_posix_str.toCharArray(dm_timezone_posix, sizeof(dm_timezone_posix));
+  // Keep an existing selected zone; derive its POSIX rules from the known list
+  // so an outdated or malformed saved rule cannot leave the clock an hour behind.
+  const TimeZoneOption* savedZone = findTimeZone(dm_tz_json_str);
+  setDeviceTimeZone(savedZone ? *savedZone : timeZones[0]);
   
   dm_token_str.toCharArray(dm_token, sizeof(dm_token));
   dm_cookies_str.toCharArray(dm_cookies, sizeof(dm_cookies));
@@ -2830,6 +2867,11 @@ void handleLocalGeneralGet() {
   html += "<form action='/save-general' method='POST'>";
   html += "<div id='js_error_console' style='display:none;background:#d9534f;color:#fff;padding:10px;margin-bottom:15px;border-radius:4px;text-align:left;font-family:monospace;font-size:14px;box-sizing:border-box;max-width:700px;margin-left:auto;margin-right:auto;'></div>";
   html += "<script>window.onerror = function(msg, url, line) { var c = document.getElementById('js_error_console'); if(c) { c.style.display='block'; c.innerHTML += '<div><strong>JS Error:</strong> ' + msg + ' at ' + url + ':' + line + '</div>'; } return false; };</script>";
+
+  html += "<details open><summary>Clock and time zone</summary><div class='form-group'>";
+  appendTimeZoneSelect(html);
+  html += "<p>Summer and winter time change automatically. Current time: " + formatLocalTime(time(nullptr), "%Y-%m-%d %H:%M") + "</p>";
+  html += "</div></details>";
   
   // 1. Display units section
   html += "<details>";
@@ -3237,6 +3279,12 @@ void handleLocalSaveGeneralPost() {
   if (checkForceReset()) return;
   
   if (localServer.hasArg("units") && localServer.hasArg("g_min") && localServer.hasArg("g_max")) {
+    const TimeZoneOption* zone = findTimeZone(localServer.arg("timezone"));
+    if (!zone) {
+      localServer.send(400, "text/plain", "Invalid time zone");
+      return;
+    }
+    setDeviceTimeZone(*zone);
     String units = localServer.arg("units");
     units.toCharArray(llu_units, sizeof(llu_units));
     
@@ -3301,6 +3349,8 @@ void handleLocalSaveGeneralPost() {
     Preferences preferences;
     preferences.begin("cgm-config", false);
     preferences.putString("units", llu_units);
+    preferences.putString("dm_tz_json", dm_timezone_json);
+    preferences.putString("dm_tz_posix", dm_timezone_posix);
     preferences.putBool("show_delta", show_delta);
     preferences.putBool("show_delta5", show_delta5);
     preferences.putInt("delta_n_cnt", delta_n_count);
@@ -4017,12 +4067,8 @@ void handleLocalImportConfig() {
       stop.toCharArray(dm_stop_sending, sizeof(dm_stop_sending));
     }
     if (doc.containsKey("dm_tz_json")) {
-      String tz_json = doc["dm_tz_json"].as<String>();
-      tz_json.toCharArray(dm_timezone_json, sizeof(dm_timezone_json));
-    }
-    if (doc.containsKey("dm_tz_posix")) {
-      String tz_posix = doc["dm_tz_posix"].as<String>();
-      tz_posix.toCharArray(dm_timezone_posix, sizeof(dm_timezone_posix));
+      const TimeZoneOption* importedZone = findTimeZone(doc["dm_tz_json"].as<String>());
+      setDeviceTimeZone(importedZone ? *importedZone : timeZones[0]);
     }
     if (doc.containsKey("dm_last_ts")) {
       String last_ts = doc["dm_last_ts"].as<String>();
@@ -4051,10 +4097,6 @@ void handleLocalImportConfig() {
       dm_2fa_pending = doc["dm_2fa_pend"].as<bool>();
     }
 
-    // Set TZ environment
-    setenv("TZ", dm_timezone_posix, 1);
-    tzset();
-    
     Preferences preferences;
     preferences.begin("cgm-config", false);
     preferences.putString("email", llu_email);
@@ -4867,21 +4909,7 @@ void handleLocalDMGet() {
   html += "</div>";
   
   html += "<div class='form-group'>";
-  html += "<label>Timezone</label>";
-  html += "<select name='timezone' id='timezone'>";
-  struct TZOpt { const char* val; const char* label; };
-  TZOpt timezones[] = {
-    {"Europe/London", "Europe/London"},
-    {"Europe/Berlin", "Europe/Berlin"},
-    {"UTC", "UTC"},
-    {"America/New_York", "America/New_York"},
-    {"America/Los_Angeles", "America/Los_Angeles"}
-  };
-  for (auto& tz : timezones) {
-    String selected = (strcmp(dm_timezone_json, tz.val) == 0) ? " selected" : "";
-    html += "<option value='" + String(tz.val) + "'" + selected + ">" + String(tz.label) + "</option>";
-  }
-  html += "</select>";
+  appendTimeZoneSelect(html);
   html += "</div>";
   
   html += "<div class='form-group'>";
@@ -5324,6 +5352,12 @@ void handleLocalDMGet() {
 
 void handleLocalDMSave() {
   if (!checkAuth()) return;
+
+  const TimeZoneOption* zone = findTimeZone(localServer.arg("timezone"));
+  if (localServer.hasArg("dm_conn_en") && !zone) {
+    localServer.send(400, "text/plain", "Invalid time zone");
+    return;
+  }
   
   dm_enable_connection = localServer.hasArg("dm_conn_en");
   
@@ -5359,28 +5393,12 @@ void handleLocalDMSave() {
     String note = localServer.arg("note");
     String start = localServer.arg("start");
     String stop = localServer.arg("stop");
-    String tz = localServer.arg("timezone");
     
     note.toCharArray(dm_note_text, sizeof(dm_note_text));
     start.toCharArray(dm_start_sending, sizeof(dm_start_sending));
     stop.toCharArray(dm_stop_sending, sizeof(dm_stop_sending));
     
-    if (tz == "Europe/London") {
-      strcpy(dm_timezone_json, "Europe/London");
-      strcpy(dm_timezone_posix, "GMT0BST,M3.5.0/1,M10.5.0/2");
-    } else if (tz == "Europe/Berlin") {
-      strcpy(dm_timezone_json, "Europe/Berlin");
-      strcpy(dm_timezone_posix, "CET-1CEST,M3.5.0,M10.5.0/3");
-    } else if (tz == "America/New_York") {
-      strcpy(dm_timezone_json, "America/New_York");
-      strcpy(dm_timezone_posix, "EST5EDT,M3.2.0,M11.1.0");
-    } else if (tz == "America/Los_Angeles") {
-      strcpy(dm_timezone_json, "America/Los_Angeles");
-      strcpy(dm_timezone_posix, "PST8PDT,M3.2.0,M11.1.0");
-    } else {
-      strcpy(dm_timezone_json, "UTC");
-      strcpy(dm_timezone_posix, "UTC0");
-    }
+    setDeviceTimeZone(*zone);
     dm_auto_category = localServer.hasArg("dm_auto_cat");
     if (localServer.hasArg("dm_fallback_cat")) {
       dm_fallback_category = localServer.arg("dm_fallback_cat").toInt();
@@ -5417,8 +5435,6 @@ void handleLocalDMSave() {
       }
     }
     
-    setenv("TZ", dm_timezone_posix, 1);
-    tzset();
   }
   
   Preferences preferences;

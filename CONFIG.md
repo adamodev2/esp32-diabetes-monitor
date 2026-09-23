@@ -77,6 +77,8 @@ Set up your display preferences, limits, and custom alerts.
 
 ---
 
+The device clock defaults to **Europe/Warsaw** and changes automatically between CET and CEST. To use another zone, open **Configure General Settings → Clock and time zone** in the web portal and save. This setting also controls Diabetes:M scheduling. Existing saved time zones are retained; if the device was previously configured for London, select Warsaw once in General Settings. The choice is included in configuration export and import.
+
 ## 📊 Step 5: Configure Diabetes:M Integration (Optional)
 
 If you track your data in Diabetes:M, you can configure the device to automatically push readings.
