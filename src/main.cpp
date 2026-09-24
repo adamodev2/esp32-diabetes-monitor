@@ -14,10 +14,12 @@
 // Instantiate the display driver
 LGFX gfx;
 LGFX_Sprite graph_sprite(&gfx);
+LGFX_Sprite banner_sprite(&gfx);
+LGFX_Sprite status_sprite(&gfx);
 
 #define GRAPH_HISTORY_SIZE 450
 
-#define BUILD_VERSION "1.0.48"
+#define BUILD_VERSION "1.0.49"
 const char ota_signature[] = "CGM-OTA-SIGNATURE:" BUILD_VERSION;
 
 
@@ -494,9 +496,12 @@ WebServer localServer(80);
 void drawSplashScreen();
 void drawDashboard(bool full_redraw = true);
 void drawHistoryGraph(bool force = false);
-void drawTrendArrow(int x, int y, int trend, uint32_t color);
-void drawThickLine(int x1, int y1, int x2, int y2, int thickness, uint32_t color);
+void drawTrendArrow(lgfx::LovyanGFX* canvas, int x, int y, int trend, uint32_t color);
+void drawThickLine(lgfx::LovyanGFX* canvas, int x1, int y1, int x2, int y2, int thickness, uint32_t color);
 void drawTopStatusBar(bool force = false);
+void pushSpriteDirty(LGFX_Sprite &sprite, uint16_t *&snapshot, bool &snapshot_valid,
+                     bool &snapshot_failed, int sprite_width, int dst_x, int dst_y,
+                     int clip_x, int clip_y, int clip_w, int clip_h, bool force);
 bool libreLinkUpLogin();
 bool libreLinkUpFetchData();
 int mapGlucoseToY(float val);
@@ -1757,6 +1762,72 @@ void drawSplashScreen() {
   gfx.drawCenterString("Build: " BUILD_VERSION, 240, 310);
 }
 
+void pushSpriteDirty(LGFX_Sprite &sprite, uint16_t *&snapshot, bool &snapshot_valid,
+                     bool &snapshot_failed, int sprite_width, int dst_x, int dst_y,
+                     int clip_x, int clip_y, int clip_w, int clip_h, bool force) {
+  if (sprite.getBuffer() == nullptr || clip_w <= 0 || clip_h <= 0) return;
+
+  if (snapshot == nullptr && !snapshot_failed) {
+    snapshot = static_cast<uint16_t*>(ps_malloc(sprite.bufferLength()));
+    if (snapshot == nullptr) {
+      snapshot_failed = true;
+      Serial.println("Dirty redraw snapshot unavailable; using full clipped sprite updates.");
+    }
+  }
+
+  uint16_t* current = static_cast<uint16_t*>(sprite.getBuffer());
+  const int tile = 8;
+  const int clip_right = clip_x + clip_w;
+  const int clip_bottom = clip_y + clip_h;
+  bool full_update = force || !snapshot_valid || snapshot == nullptr;
+
+  gfx.startWrite();
+  if (full_update) {
+    gfx.setClipRect(clip_x, clip_y, clip_w, clip_h);
+    sprite.pushSprite(&gfx, dst_x, dst_y);
+  } else {
+    for (int y = clip_y; y < clip_bottom; y += tile) {
+      int tile_h = min(tile, clip_bottom - y);
+      int run_start = -1;
+
+      for (int x = clip_x; x < clip_right; x += tile) {
+        int tile_w = min(tile, clip_right - x);
+        int src_x = x - dst_x;
+        int src_y = y - dst_y;
+        bool dirty = false;
+
+        for (int row = 0; row < tile_h; row++) {
+          size_t offset = (src_y + row) * sprite_width + src_x;
+          if (memcmp(current + offset, snapshot + offset, tile_w * sizeof(uint16_t)) != 0) {
+            dirty = true;
+            break;
+          }
+        }
+
+        if (dirty) {
+          if (run_start < 0) run_start = x;
+        } else if (run_start >= 0) {
+          gfx.setClipRect(run_start, y, x - run_start, tile_h);
+          sprite.pushSprite(&gfx, dst_x, dst_y);
+          run_start = -1;
+        }
+      }
+
+      if (run_start >= 0) {
+        gfx.setClipRect(run_start, y, clip_right - run_start, tile_h);
+        sprite.pushSprite(&gfx, dst_x, dst_y);
+      }
+    }
+  }
+  gfx.clearClipRect();
+  gfx.endWrite();
+
+  if (snapshot != nullptr) {
+    memcpy(snapshot, current, sprite.bufferLength());
+    snapshot_valid = true;
+  }
+}
+
 void drawDashboard(bool full_redraw) {
   if (full_redraw) {
     gfx.fillScreen(0x000000);
@@ -1779,6 +1850,27 @@ void drawDashboard(bool full_redraw) {
     || banner_top != rendered_banner_top;
   
   if (redraw_banner) {
+  static int8_t banner_buffer_state = 0;
+  static uint16_t* banner_snapshot = nullptr;
+  static bool banner_snapshot_valid = false;
+  static bool banner_snapshot_failed = false;
+
+  if (banner_buffer_state == 0) {
+    banner_sprite.setPsram(true);
+    banner_sprite.setColorDepth(16);
+    if (banner_sprite.createSprite(480, 180) != nullptr) {
+      banner_buffer_state = 1;
+      Serial.printf("Banner buffer ready in PSRAM: %u bytes\n", (unsigned)banner_sprite.bufferLength());
+    } else {
+      banner_buffer_state = -1;
+      Serial.println("Banner PSRAM buffer unavailable; using direct redraw.");
+    }
+  }
+
+  lgfx::LovyanGFX* banner_canvas = banner_buffer_state == 1
+    ? static_cast<lgfx::LovyanGFX*>(&banner_sprite)
+    : static_cast<lgfx::LovyanGFX*>(&gfx);
+
   // Set alert color coding based on thresholds and stale status
   uint32_t status_color = 0x888888; // Default Grey
   
@@ -1793,11 +1885,11 @@ void drawDashboard(bool full_redraw) {
   int banner_height = banner_bottom - banner_top;
   
   // 1. Draw the Banner Background: Y = [banner_top, banner_bottom]
-  gfx.fillRect(0, banner_top, 480, banner_height, status_color);
+  banner_canvas->fillRect(0, banner_top, 480, banner_height, status_color);
   
   // 2. Display the glucose reading in black text on the banner background
-  gfx.setTextColor(0x000000);
-  gfx.setFont(&fonts::DejaVu72); // Massive anti-aliased digits
+  banner_canvas->setTextColor(0x000000);
+  banner_canvas->setFont(&fonts::DejaVu72); // Massive anti-aliased digits
   
   String glucose_str = "---";
   if (!is_stale) {
@@ -1845,8 +1937,8 @@ void drawDashboard(bool full_redraw) {
       d5_formatted = String(delta_n_count) + ":  " + d5_raw;
     }
     
-    gfx.setFont(&fonts::DejaVu72);
-    int main_w = gfx.textWidth(glucose_str.c_str());
+    banner_canvas->setFont(&fonts::DejaVu72);
+    int main_w = banner_canvas->textWidth(glucose_str.c_str());
     
     int delta_w = 0;
     int bracket_open_w = 0;
@@ -1858,22 +1950,22 @@ void drawDashboard(bool full_redraw) {
     
     if (has_delta1 && has_delta5) {
       // Stacked in DejaVu24 inside DejaVu72 brackets
-      gfx.setFont(&fonts::DejaVu72);
-      bracket_open_w = gfx.textWidth("(");
-      bracket_close_w = gfx.textWidth(")");
+      banner_canvas->setFont(&fonts::DejaVu72);
+      bracket_open_w = banner_canvas->textWidth("(");
+      bracket_close_w = banner_canvas->textWidth(")");
       
-      gfx.setFont(&fonts::DejaVu24);
-      int line1_total_w = tri_w + tri_gap + gfx.textWidth(d1_formatted.c_str());
-      int line2_total_w = tri_w + tri_gap + gfx.textWidth(d5_formatted.c_str());
+      banner_canvas->setFont(&fonts::DejaVu24);
+      int line1_total_w = tri_w + tri_gap + banner_canvas->textWidth(d1_formatted.c_str());
+      int line2_total_w = tri_w + tri_gap + banner_canvas->textWidth(d5_formatted.c_str());
       int text_w = max(line1_total_w, line2_total_w);
       delta_w = bracket_open_w + text_w + bracket_close_w;
     } else {
       // Single line in DejaVu24 (including brackets)
-      gfx.setFont(&fonts::DejaVu24);
+      banner_canvas->setFont(&fonts::DejaVu24);
       String inner_str = has_delta1 ? d1_formatted : d5_formatted;
-      int paren_open_w = gfx.textWidth("(");
-      int paren_close_w = gfx.textWidth(")");
-      int text_w = gfx.textWidth(inner_str.c_str());
+      int paren_open_w = banner_canvas->textWidth("(");
+      int paren_close_w = banner_canvas->textWidth(")");
+      int text_w = banner_canvas->textWidth(inner_str.c_str());
       delta_w = paren_open_w + tri_w + tri_gap + text_w + paren_close_w;
     }
     
@@ -1886,22 +1978,22 @@ void drawDashboard(bool full_redraw) {
     int start_x = (480 - total_w) / 2;
     
     // Draw main value
-    gfx.setTextDatum(textdatum_t::top_left);
-    gfx.setTextColor(0x000000);
-    gfx.setFont(&fonts::DejaVu72);
-    gfx.drawString(glucose_str.c_str(), start_x, val_y);
+    banner_canvas->setTextDatum(textdatum_t::top_left);
+    banner_canvas->setTextColor(0x000000);
+    banner_canvas->setFont(&fonts::DejaVu72);
+    banner_canvas->drawString(glucose_str.c_str(), start_x, val_y);
     
     int deltas_x = start_x + main_w + 8;
     
     if (has_delta1 && has_delta5) {
       // 1. Draw large open bracket "(" in DejaVu72
-      gfx.setFont(&fonts::DejaVu72);
-      gfx.drawString("(", deltas_x, val_y);
+      banner_canvas->setFont(&fonts::DejaVu72);
+      banner_canvas->drawString("(", deltas_x, val_y);
       
       // 2. Draw stacked text in DejaVu24 (centered within text_w)
-      gfx.setFont(&fonts::DejaVu24);
-      int line1_total_w = tri_w + tri_gap + gfx.textWidth(d1_formatted.c_str());
-      int line2_total_w = tri_w + tri_gap + gfx.textWidth(d5_formatted.c_str());
+      banner_canvas->setFont(&fonts::DejaVu24);
+      int line1_total_w = tri_w + tri_gap + banner_canvas->textWidth(d1_formatted.c_str());
+      int line2_total_w = tri_w + tri_gap + banner_canvas->textWidth(d5_formatted.c_str());
       int text_w = max(line1_total_w, line2_total_w);
       
       int line1_x = deltas_x + bracket_open_w + (text_w - line1_total_w) / 2;
@@ -1909,61 +2001,65 @@ void drawDashboard(bool full_redraw) {
       
       // Draw Line 1 (dt1) with vector triangle
       int tri1_y = val_y + 10 + (24 - tri_h) / 2;
-      gfx.fillTriangle(line1_x + tri_w / 2, tri1_y, line1_x, tri1_y + tri_h, line1_x + tri_w, tri1_y + tri_h, 0x000000);
-      gfx.drawString(d1_formatted.c_str(), line1_x + tri_w + tri_gap, val_y + 10);
+      banner_canvas->fillTriangle(line1_x + tri_w / 2, tri1_y, line1_x, tri1_y + tri_h, line1_x + tri_w, tri1_y + tri_h, 0x000000);
+      banner_canvas->drawString(d1_formatted.c_str(), line1_x + tri_w + tri_gap, val_y + 10);
       
       // Draw Line 2 (dt5) with vector triangle
       int tri2_y = val_y + 38 + (24 - tri_h) / 2;
-      gfx.fillTriangle(line2_x + tri_w / 2, tri2_y, line2_x, tri2_y + tri_h, line2_x + tri_w, tri2_y + tri_h, 0x000000);
-      gfx.drawString(d5_formatted.c_str(), line2_x + tri_w + tri_gap, val_y + 38);
+      banner_canvas->fillTriangle(line2_x + tri_w / 2, tri2_y, line2_x, tri2_y + tri_h, line2_x + tri_w, tri2_y + tri_h, 0x000000);
+      banner_canvas->drawString(d5_formatted.c_str(), line2_x + tri_w + tri_gap, val_y + 38);
       
       // 3. Draw large close bracket ")" in DejaVu72
-      gfx.setFont(&fonts::DejaVu72);
-      gfx.drawString(")", deltas_x + bracket_open_w + text_w, val_y);
+      banner_canvas->setFont(&fonts::DejaVu72);
+      banner_canvas->drawString(")", deltas_x + bracket_open_w + text_w, val_y);
     } else {
       // Draw single line with triangle (either ▲  0.5 or ▲5:  -0.2)
-      gfx.setFont(&fonts::DejaVu24);
+      banner_canvas->setFont(&fonts::DejaVu24);
       String inner_str = has_delta1 ? d1_formatted : d5_formatted;
-      int paren_open_w = gfx.textWidth("(");
-      int text_w = gfx.textWidth(inner_str.c_str());
+      int paren_open_w = banner_canvas->textWidth("(");
+      int text_w = banner_canvas->textWidth(inner_str.c_str());
       
-      gfx.drawString("(", deltas_x, val_y + 24);
+      banner_canvas->drawString("(", deltas_x, val_y + 24);
       
       int tri_y = val_y + 24 + (24 - tri_h) / 2;
       int tri_x = deltas_x + paren_open_w;
-      gfx.fillTriangle(tri_x + tri_w / 2, tri_y, tri_x, tri_y + tri_h, tri_x + tri_w, tri_y + tri_h, 0x000000);
+      banner_canvas->fillTriangle(tri_x + tri_w / 2, tri_y, tri_x, tri_y + tri_h, tri_x + tri_w, tri_y + tri_h, 0x000000);
       
-      gfx.drawString(inner_str.c_str(), tri_x + tri_w + tri_gap, val_y + 24);
-      gfx.drawString(")", tri_x + tri_w + tri_gap + text_w, val_y + 24);
+      banner_canvas->drawString(inner_str.c_str(), tri_x + tri_w + tri_gap, val_y + 24);
+      banner_canvas->drawString(")", tri_x + tri_w + tri_gap + text_w, val_y + 24);
     }
     
     // Draw trend arrow (if enabled)
     if (arrow_w > 0) {
       int arrow_x = deltas_x + delta_w + 8 + 20;
-      drawTrendArrow(arrow_x, arrow_y, last_trend, 0x000000);
+      drawTrendArrow(banner_canvas, arrow_x, arrow_y, last_trend, 0x000000);
     }
   } else {
     // No deltas enabled, center glucose value
     int centerX = (llu_show_trend && !is_stale) ? 210 : 240;
-    gfx.setTextDatum(textdatum_t::top_center);
-    gfx.setTextColor(0x000000);
-    gfx.setFont(&fonts::DejaVu72);
-    gfx.drawCenterString(glucose_str.c_str(), centerX, val_y);
+    banner_canvas->setTextDatum(textdatum_t::top_center);
+    banner_canvas->setTextColor(0x000000);
+    banner_canvas->setFont(&fonts::DejaVu72);
+    banner_canvas->drawCenterString(glucose_str.c_str(), centerX, val_y);
     
     // Draw trend arrow (if enabled)
     if (llu_show_trend && !is_stale) {
-      drawTrendArrow(330, arrow_y, last_trend, 0x000000);
+      drawTrendArrow(banner_canvas, 330, arrow_y, last_trend, 0x000000);
     }
   }
   
   // Reset text datum to standard top_left
-  gfx.setTextDatum(textdatum_t::top_left);
+  banner_canvas->setTextDatum(textdatum_t::top_left);
   
   // 4. Draw the custom short message centered under the value
   if (banner_msg.length() > 0 && !is_stale) {
-    gfx.setFont(&fonts::DejaVu18);
-    gfx.setTextColor(0x000000);
-    gfx.drawCenterString(banner_msg.c_str(), 240, banner_top + 105);
+    banner_canvas->setFont(&fonts::DejaVu18);
+    banner_canvas->setTextColor(0x000000);
+    banner_canvas->drawCenterString(banner_msg.c_str(), 240, banner_top + 105);
+  }
+  if (banner_buffer_state == 1) {
+    pushSpriteDirty(banner_sprite, banner_snapshot, banner_snapshot_valid, banner_snapshot_failed,
+                    480, 0, 0, 0, banner_top, 480, banner_height, full_redraw);
   }
   rendered_timestamp = last_timestamp;
   rendered_stale = is_stale;
@@ -1980,58 +2076,58 @@ void drawDashboard(bool full_redraw) {
   drawTopStatusBar(full_redraw);
 }
 
-void drawThickLine(int x1, int y1, int x2, int y2, int thickness, uint32_t color) {
+void drawThickLine(lgfx::LovyanGFX* canvas, int x1, int y1, int x2, int y2, int thickness, uint32_t color) {
   if (thickness <= 1) {
-    gfx.drawLine(x1, y1, x2, y2, color);
+    canvas->drawLine(x1, y1, x2, y2, color);
     return;
   }
   
   for (int i = -thickness/2; i <= thickness/2; i++) {
     if (abs(x1 - x2) > abs(y1 - y2)) { // Horizontal-ish
-      gfx.drawLine(x1, y1 + i, x2, y2 + i, color);
+      canvas->drawLine(x1, y1 + i, x2, y2 + i, color);
     } else { // Vertical-ish
-      gfx.drawLine(x1 + i, y1, x2 + i, y2, color);
+      canvas->drawLine(x1 + i, y1, x2 + i, y2, color);
     }
   }
 }
 
-void drawTrendArrow(int x, int y, int trend, uint32_t color) {
+void drawTrendArrow(lgfx::LovyanGFX* canvas, int x, int y, int trend, uint32_t color) {
   int len = 25;       // Made larger to match value size
   int arrow_sz = 12;  // Made larger to match value size
   int thickness = 6;  // Thicker lines
   
   switch (trend) {
     case 1: // Down-Down (Falling rapidly) -> straight down
-      drawThickLine(x, y - len, x, y + len, thickness, color);
-      gfx.fillTriangle(x, y + len + 3, x - arrow_sz, y + len - arrow_sz, x + arrow_sz, y + len - arrow_sz, color);
+      drawThickLine(canvas, x, y - len, x, y + len, thickness, color);
+      canvas->fillTriangle(x, y + len + 3, x - arrow_sz, y + len - arrow_sz, x + arrow_sz, y + len - arrow_sz, color);
       break;
       
     case 2: // Down (Falling) -> diagonal down-right
-      drawThickLine(x - len/2 - 4, y - len/2 - 4, x + len/2 + 4, y + len/2 + 4, thickness, color);
-      gfx.fillTriangle(x + len/2 + 5, y + len/2 + 5,
+      drawThickLine(canvas, x - len/2 - 4, y - len/2 - 4, x + len/2 + 4, y + len/2 + 4, thickness, color);
+      canvas->fillTriangle(x + len/2 + 5, y + len/2 + 5,
                        x + len/2 - arrow_sz, y + len/2,
                        x + len/2, y + len/2 - arrow_sz, color);
       break;
       
     case 3: // Flat (Stable) -> horizontal right
-      drawThickLine(x - len, y, x + len, y, thickness, color);
-      gfx.fillTriangle(x + len + 3, y, x + len - arrow_sz, y - arrow_sz, x + len - arrow_sz, y + arrow_sz, color);
+      drawThickLine(canvas, x - len, y, x + len, y, thickness, color);
+      canvas->fillTriangle(x + len + 3, y, x + len - arrow_sz, y - arrow_sz, x + len - arrow_sz, y + arrow_sz, color);
       break;
       
     case 4: // Up (Rising) -> diagonal up-right
-      drawThickLine(x - len/2 - 4, y + len/2 + 4, x + len/2 + 4, y - len/2 - 4, thickness, color);
-      gfx.fillTriangle(x + len/2 + 5, y - len/2 - 5,
+      drawThickLine(canvas, x - len/2 - 4, y + len/2 + 4, x + len/2 + 4, y - len/2 - 4, thickness, color);
+      canvas->fillTriangle(x + len/2 + 5, y - len/2 - 5,
                        x + len/2 - arrow_sz, y - len/2,
                        x + len/2, y - len/2 + arrow_sz, color);
       break;
       
     case 5: // Up-Up (Rising rapidly) -> straight up
-      drawThickLine(x, y + len, x, y - len, thickness, color);
-      gfx.fillTriangle(x, y - len - 3, x - arrow_sz, y - len + arrow_sz, x + arrow_sz, y - len + arrow_sz, color);
+      drawThickLine(canvas, x, y + len, x, y - len, thickness, color);
+      canvas->fillTriangle(x, y - len - 3, x - arrow_sz, y - len + arrow_sz, x + arrow_sz, y - len + arrow_sz, color);
       break;
       
     default: // Unknown / Flat
-      drawThickLine(x - len, y, x + len, y, thickness, color);
+      drawThickLine(canvas, x - len, y, x + len, y, thickness, color);
       break;
   }
 }
@@ -2051,6 +2147,9 @@ void drawHistoryGraph(bool force) {
   static int8_t buffer_state = 0;
   static long rendered_minute = -1;
   static uint32_t rendered_revision = UINT32_MAX;
+  static uint16_t* graph_snapshot = nullptr;
+  static bool graph_snapshot_valid = false;
+  static bool graph_snapshot_failed = false;
 
   long current_minute = isTimeSynced()
     ? (long)(time(nullptr) / 60)
@@ -2107,9 +2206,8 @@ void drawHistoryGraph(bool force) {
     canvas->setTextColor(0x666666);
     canvas->drawCenterString("Awaiting history data...", 240, startY + 100);
     if (use_buffer) {
-      gfx.startWrite();
-      graph_sprite.pushSprite(0, graph_region_y);
-      gfx.endWrite();
+      pushSpriteDirty(graph_sprite, graph_snapshot, graph_snapshot_valid, graph_snapshot_failed,
+                      480, 0, graph_region_y, 0, graph_region_y, 480, graph_region_h, force);
     }
     return;
   }
@@ -2172,9 +2270,8 @@ void drawHistoryGraph(bool force) {
   canvas->drawString(high_label, startX + 8, y_high - 7);
 
   if (use_buffer) {
-    gfx.startWrite();
-    graph_sprite.pushSprite(0, graph_region_y);
-    gfx.endWrite();
+    pushSpriteDirty(graph_sprite, graph_snapshot, graph_snapshot_valid, graph_snapshot_failed,
+                    480, 0, graph_region_y, 0, graph_region_y, 480, graph_region_h, force);
   }
 }
 
@@ -2218,14 +2315,35 @@ void drawTopStatusBar(bool force) {
   rendered_bar_height = bar_height;
   rendered_dm_status = dm_last_sent_status;
 
-  gfx.fillRect(0, 0, 480, bar_height, 0xFFFFFF); // White background
+  static int8_t status_buffer_state = 0;
+  static uint16_t* status_snapshot = nullptr;
+  static bool status_snapshot_valid = false;
+  static bool status_snapshot_failed = false;
+
+  if (status_buffer_state == 0) {
+    status_sprite.setPsram(true);
+    status_sprite.setColorDepth(16);
+    if (status_sprite.createSprite(480, 72) != nullptr) {
+      status_buffer_state = 1;
+      Serial.printf("Status buffer ready in PSRAM: %u bytes\n", (unsigned)status_sprite.bufferLength());
+    } else {
+      status_buffer_state = -1;
+      Serial.println("Status PSRAM buffer unavailable; using direct redraw.");
+    }
+  }
+
+  lgfx::LovyanGFX* status_canvas = status_buffer_state == 1
+    ? static_cast<lgfx::LovyanGFX*>(&status_sprite)
+    : static_cast<lgfx::LovyanGFX*>(&gfx);
+
+  status_canvas->fillRect(0, 0, 480, bar_height, 0xFFFFFF); // White background
   
   // Line 1: current local time and age of the latest Libre reading
-  gfx.setFont(&fonts::DejaVu18);
+  status_canvas->setFont(&fonts::DejaVu18);
   String current_time = isTimeSynced() ? formatLocalTime(time(nullptr), "%H:%M") : "--:--";
   String msg = "";
   if (last_fetch_time == 0) {
-    gfx.setTextColor(0x000000); // Black text
+    status_canvas->setTextColor(0x000000); // Black text
     msg = current_time + " (Awaiting data)";
   } else {
     long age_minutes = last_reading_epoch > 0 && isTimeSynced()
@@ -2233,31 +2351,31 @@ void drawTopStatusBar(bool force) {
       : (long)(millis() - last_fetch_time) / 60000L;
     if (age_minutes < 0) age_minutes = 0;
     if (age_minutes >= 15) {
-      gfx.setTextColor(0xCC0000); // Dark red warning for stale readings
+      status_canvas->setTextColor(0xCC0000); // Dark red warning for stale readings
     } else {
-      gfx.setTextColor(0x000000); // Black text
+      status_canvas->setTextColor(0x000000); // Black text
     }
     msg = current_time + " (Updated " + String(age_minutes) + "m ago)";
   }
-  gfx.drawString(msg, 15, (dm_enable_connection && dm_auto_send) ? 6 : 10);
+  status_canvas->drawString(msg, 15, (dm_enable_connection && dm_auto_send) ? 6 : 10);
   
   uint32_t wifi_color = 0x008800; // Dark green
   
   if (WiFi.status() != WL_CONNECTED) {
-    gfx.setTextColor(0xCC0000); // Dark red
-    gfx.drawString("WiFi Disconnected", 310, (dm_enable_connection && dm_auto_send) ? 6 : 10);
+    status_canvas->setTextColor(0xCC0000); // Dark red
+    status_canvas->drawString("WiFi Disconnected", 310, (dm_enable_connection && dm_auto_send) ? 6 : 10);
   } else {
     if (rssi < -78) {
       wifi_color = 0xBB5500; // Dark orange if signal is weak
     }
-    gfx.setTextColor(wifi_color);
-    gfx.drawString("WiFi Connected", 330, (dm_enable_connection && dm_auto_send) ? 6 : 10);
+    status_canvas->setTextColor(wifi_color);
+    status_canvas->drawString("WiFi Connected", 330, (dm_enable_connection && dm_auto_send) ? 6 : 10);
   }
   
   // Line 2: Diabetes:M background status
   if (dm_enable_connection && dm_auto_send) {
-    gfx.setFont(&fonts::DejaVu18); // anti-aliased 18px font (DejaVu14 not available)
-    gfx.setTextColor(0x000000);
+    status_canvas->setFont(&fonts::DejaVu18); // anti-aliased 18px font (DejaVu14 not available)
+    status_canvas->setTextColor(0x000000);
     
     String next_str = "--:--";
     if (dm_next_send_epoch > 0) {
@@ -2285,14 +2403,18 @@ void drawTopStatusBar(bool force) {
     String line2_left = "Last: " + last_sent_str;
     String line2_right = "Next: " + next_str;
     
-    gfx.drawString(line2_left, 15, 31);
-    gfx.drawString(line2_right, 330, 31);
+    status_canvas->drawString(line2_left, 15, 31);
+    status_canvas->drawString(line2_right, 330, 31);
     
     if (dm_2fa_pending) {
-      gfx.fillRect(0, 52, 480, 20, 0xCC0000); // Solid red background
-      gfx.setTextColor(0xFFFFFF); // White text
-      gfx.drawString("Diabetes:M - Please re-authenticate", 15, 53);
+      status_canvas->fillRect(0, 52, 480, 20, 0xCC0000); // Solid red background
+      status_canvas->setTextColor(0xFFFFFF); // White text
+      status_canvas->drawString("Diabetes:M - Please re-authenticate", 15, 53);
     }
+  }
+  if (status_buffer_state == 1) {
+    pushSpriteDirty(status_sprite, status_snapshot, status_snapshot_valid, status_snapshot_failed,
+                    480, 0, 0, 0, 0, 480, bar_height, force);
   }
 }
 
